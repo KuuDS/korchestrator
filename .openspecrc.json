@@ -1,0 +1,29 @@
+{
+  "featureFlags": {},
+  "profile": "custom",
+  "delivery": "both",
+  "language": "zh-CN",
+  "locale": "zh-CN",
+  "documentation": {
+    "language": "zh-CN",
+    "defaultDocLanguage": "zh",
+    "supportedLanguages": ["zh", "zh-CN"],
+    "preferChinese": true
+  },
+  "workflows": [
+    "propose",
+    "explore",
+    "new",
+    "continue",
+    "apply",
+    "ff",
+    "sync",
+    "archive",
+    "bulk-archive",
+    "verify"
+  ],
+  "project": {
+    "name": "korchestrator",
+    "description": "OpenClaw Plan-Task-Build 多智能体编排插件"
+  }
+}

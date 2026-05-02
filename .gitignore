@@ -60,6 +60,11 @@ workspace/
 PLANS/
 *.plan
 
+# OpenSpec
+.openspec/local/
+.openspec/cache/
+*.opsx.lock
+
 # TypeScript
 *.js.map
 *.d.ts.map
