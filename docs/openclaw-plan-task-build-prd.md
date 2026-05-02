@@ -1,0 +1,1057 @@
+# OpenClaw Plan-Task-Build Agent 组合模式 — 需求分析与开发文档
+
+> **文档用途**：提交给 Claude Code 进行开发实现
+> **目标读者**：AI Agent 开发者
+> **技术栈**：TypeScript / OpenClaw Plugin SDK / Node.js
+
+---
+
+## 1. 项目概述
+
+### 1.1 背景
+
+OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct Runtime、Skill Registry、Markdown Memory 等核心能力。当前 OpenClaw 已原生支持**插件钩子系统**（30+ 扩展点）和 **Subagent 生命周期管理**（4 个专用钩子），但尚未提供**复杂任务分解与多 Agent 协作编排**的官方解决方案。
+
+本插件填补这一空白：利用 OpenClaw 原生钩子实现**Plan-Task-Build** Agent 组合模式，让 OpenClaw 具备分解复杂任务、调度专业 Subagent 并行执行、动态重规划的能力。
+
+### 1.2 目标
+
+开发一个 OpenClaw 插件 `openclaw-plugin-plan-subagent`，通过纯插件形式（零侵入核心代码）实现：
+
+- **Plan（规划）**：接收用户请求，智能判断复杂度，自动分解为带依赖关系的子任务列表
+- **Task（调度）**：根据任务所需的 Skill 自动路由到专业 Subagent（Researcher / Coder / Browser / Reviewer）
+- **Build（执行）**：Subagent 在受限上下文中并行执行工具调用，动态重规划失败任务，最终聚合交付
+
+### 1.3 设计原则
+
+1. **零侵入**：不修改 OpenClaw 核心代码一行，纯插件实现
+2. **复用原生**：直接复用 OpenClaw 的 Subagent 生命周期、Harness revise/finalize、Session 持久化等原生机制
+3. **可插拔**：独立发布、独立版本管理，`npm install` 即启用，可随时卸载
+
+---
+
+## 2. 术语定义
+
+| 术语 | 定义 |
+|------|------|
+| **Plan** | 由 Planner 生成的结构化任务分解方案，包含 Task List 和依赖关系 |
+| **Task** | Plan 中的单个原子子任务，绑定特定 Skill 需求和执行状态 |
+| **Build** | Subagent 实际执行 Task 的过程，包括工具调用、结果收集、重规划 |
+| **Subagent** | 通过 OpenClaw Subagent 钩子管理的子智能体执行上下文，绑定特定 Skill 子集 |
+| **Hook** | OpenClaw 插件扩展点，通过 `api.on(name, handler)` 注册 |
+| **Session Extension** | 通过 `api.registerSessionExtension()` 实现的会话级持久化状态 |
+| **Turn Injection** | 通过 `api.enqueueNextTurnInjection()` 实现的跨轮次上下文注入 |
+
+---
+
+## 3. 功能需求
+
+### 3.1 Plan 规划模块
+
+#### FR-PLAN-001 复杂度分类
+- 插件在 `before_agent_reply` 钩子中拦截用户请求
+- 调用轻量 LLM（GPT-4o-mini）判断复杂度：simple / complex
+- simple 请求不干预，走正常 ReAct 流程
+- complex 请求触发 Plan 分解流程
+
+#### FR-PLAN-002 任务分解
+- 调用 LLM 将用户请求分解为结构化 Task List
+- 每个 Task 包含：id, description, skills[], dependencies[], status, requiresApproval
+- 依赖关系需验证无环（DAG 校验）
+- 高风险操作（如 shell 执行）自动标记 requiresApproval=true
+
+#### FR-PLAN-003 状态持久化
+- Plan 状态通过 `registerSessionExtension("plan_state")` 持久化
+- 支持随会话保存/恢复
+- 清理语义：reset/delete/disable 时移除状态，restart 时保留
+
+#### FR-PLAN-004 跨轮次注入
+- Plan 通过 `enqueueNextTurnInjection()` 注入下一轮模型上下文
+- 使用 idempotencyKey 去重
+- 过期注入自动丢弃
+
+### 3.2 Task 调度模块
+
+#### FR-TASK-001 Skill 匹配路由
+- 通过 `subagent_delivery_target` 钩子实现 Task → Subagent 路由
+- 根据 Task 的 skills[] 需求匹配最合适的 AgentRole
+- 匹配策略：精确匹配 → 最大交集匹配 → 降级匹配
+
+#### FR-TASK-002 角色定义
+预定义 4 个标准角色：
+
+| 角色 | Agent ID | Skills | Model |
+|------|----------|--------|-------|
+| Researcher | `researcher` | search, browser | gpt-4o-mini |
+| Coder | `coder` | shell, code, file | gpt-4o |
+| BrowserOperator | `browser` | browser | gpt-4o-mini |
+| Reviewer | `reviewer` | file, code | gpt-4o-mini |
+
+#### FR-TASK-003 并发控制
+- 默认最大并发数：3
+- 通过 `subagent_spawning` 钩子控制创建速率
+- 依赖未满足的任务排队等待
+
+#### FR-TASK-004 生命周期跟踪
+- `subagent_spawned`：记录启动日志、初始化监控
+- `subagent_ended`：收集执行结果、更新 Plan 状态
+
+### 3.3 Build 执行模块
+
+#### FR-BUILD-001 受限工具执行
+- Subagent 的工具调用通过 `before_tool_call` 钩子拦截
+- 支持参数重写、执行阻止、requireApproval 审批
+
+#### FR-BUILD-002 结果收集
+- `after_tool_call` 钩子观察工具结果、错误和时长
+- 结果通过 `tool_result_persist` 写入 Blackboard（WORKSPACE/{taskId}.md）
+
+#### FR-BUILD-003 动态重规划（Replanner）
+- 通过 `before_agent_finalize` 钩子实现 revise/finalize 决策
+- 检查所有任务状态：
+  - 全部完成 → `{ action: "finalize" }`
+  - 有失败任务 → `{ action: "revise", reason }` 触发重规划
+- 支持 4 种修复策略：
+  - `retry`：直接重试（临时错误）
+  - `decompose`：拆分为更小子任务
+  - `skip`：标记跳过（非阻塞）
+  - `escalate`：需要人工介入
+
+#### FR-BUILD-004 人工审批
+- 高风险操作通过 `before_tool_call` + `requireApproval` 暂停执行
+- 用户通过 `/approve` 命令批准（单次/永久/拒绝）
+- `onResolution` 回调接收决策结果
+
+#### FR-BUILD-005 结果聚合与交付
+- 所有任务 finalize 后，聚合各 Subagent 输出
+- `agent_end` 钩子记录执行指标（即发即忘，30秒超时保护）
+- 最终结果返回给用户
+
+### 3.4 监控与可观测性
+
+#### FR-MON-001 执行进度
+- 通过 `registerSessionExtension` 暴露 Plan 执行状态
+- Control UI 可通过 `pluginExtensions` 渲染进度
+
+#### FR-MON-002 Heartbeat 汇报
+- `heartbeat_prompt_contribution` 钩子汇报当前 Plan 执行摘要
+- 适用于后台监控和长时间运行任务
+
+#### FR-MON-003 日志记录
+- 关键事件记录：Plan 生成、Task 路由、Subagent 启动/结束、重规划决策
+- 通过 `agent_end` 收集执行时长和成功/失败统计
+
+---
+
+## 4. 技术架构
+
+### 4.1 钩子映射总览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     OpenClaw Gateway                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ before_agent│  │before_prompt│  │ subagent_delivery   │ │
+│  │ _reply      │  │ _build      │  │ _target             │ │
+│  │  (Plan)     │  │  (Inject)   │  │  (Task Route)       │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
+│         │                 │                     │            │
+│  ┌──────▼─────────────────▼─────────────────────▼──────────┐ │
+│  │              Plan-Subagent Plugin                        │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │ │
+│  │  │ Planner  │  │ Task     │  │ Replanner│             │ │
+│  │  │          │  │ Router   │  │          │             │ │
+│  │  │ classify │  │          │  │ check()  │             │ │
+│  │  │ create   │  │ getReady │  │ revise/  │             │ │
+│  │  │ Plan()   │  │ routeBy  │  │ finalize │             │ │
+│  │  │          │  │ Skill()  │  │          │             │ │
+│  │  └──────────┘  └──────────┘  └──────────┘             │ │
+│  │                                                          │ │
+│  │  registerSessionExtension("plan_state")                  │ │
+│  │  enqueueNextTurnInjection()                              │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│         │                 │                     │            │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────────▼──────────┐ │
+│  │before_tool  │  │after_tool   │  │before_agent         │ │
+│  │_call        │  │_call        │  │_finalize            │ │
+│  │  (拦截/审批)│  │  (结果收集) │  │  (revise/finalize)  │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 核心钩子注册顺序
+
+| 优先级 | 钩子 | 用途 | 返回值 |
+|--------|------|------|--------|
+| 80 | `before_agent_reply` | 复杂任务检测 + Plan 生成 | `{ syntheticReply }` |
+| 70 | `before_prompt_build` | Plan 上下文注入 Prompt | `{ prependContext }` |
+| 70 | `subagent_delivery_target` | Task → Subagent 路由 | `{ targetAgentId }` |
+| 70 | `subagent_spawning` | Subagent 创建决策 | — |
+| 60 | `before_agent_finalize` | 重规划 revise/finalize | `{ action: "revise" \| "finalize" }` |
+| 50 | `before_tool_call` | 工具拦截/审批 | `{ params?, block?, requireApproval? }` |
+| 50 | `after_tool_call` | 结果收集 | — |
+| — | `agent_end` | 执行指标记录 | — |
+
+---
+
+## 5. 数据结构设计
+
+### 5.1 Plan 状态（Session Extension）
+
+```typescript
+interface Plan {
+  id: string;
+  status: "planning" | "executing" | "reviewing" | "done";
+  tasks: Task[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface Task {
+  id: string;
+  description: string;
+  skills: string[];
+  dependencies: string[];
+  status: "pending" | "running" | "done" | "failed" | "skipped";
+  requiresApproval: boolean;
+  assignedAgent?: string;
+  result?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+interface AgentRole {
+  agentId: string;
+  name: string;
+  skills: string[];
+  model: string;
+}
+```
+
+### 5.2 修复决策
+
+```typescript
+interface RepairDecision {
+  strategy: "retry" | "decompose" | "skip" | "escalate";
+  newTasks?: Task[];
+  reason: string;
+}
+
+interface HealthCheck {
+  needsReroute: boolean;
+  failedTasks: Task[];
+  reason?: string;
+}
+```
+
+### 5.3 插件配置
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "plan-subagent": {
+        "config": {
+          "plannerModel": "gpt-4o-mini",
+          "replannerModel": "gpt-4o-mini",
+          "maxConcurrency": 3,
+          "maxStepsPerAgent": 20,
+          "agentRoles": [
+            {
+              "agentId": "researcher",
+              "name": "Researcher",
+              "skills": ["search", "browser"],
+              "model": "gpt-4o-mini"
+            },
+            {
+              "agentId": "coder",
+              "name": "Coder",
+              "skills": ["shell", "code", "file"],
+              "model": "gpt-4o"
+            },
+            {
+              "agentId": "browser",
+              "name": "BrowserOperator",
+              "skills": ["browser"],
+              "model": "gpt-4o-mini"
+            },
+            {
+              "agentId": "reviewer",
+              "name": "Reviewer",
+              "skills": ["file", "code"],
+              "model": "gpt-4o-mini"
+            }
+          ]
+        },
+        "hooks": {
+          "allowConversationAccess": true
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## 6. 模块接口设计
+
+### 6.1 Planner 模块
+
+```typescript
+export class Planner {
+  constructor(config: { model: string; maxTasks?: number });
+
+  /** 判断请求复杂度 */
+  async classify(request: string): Promise<"simple" | "complex">;
+
+  /** 生成任务分解 Plan */
+  async createPlan(request: string): Promise<Plan>;
+
+  /** Plan 序列化 */
+  toMarkdown(plan: Plan): string;
+}
+```
+
+### 6.2 TaskRouter 模块
+
+```typescript
+export class TaskRouter {
+  constructor(config: { maxConcurrency: number; agentPool: AgentRole[] });
+
+  /** 获取依赖已满足的就绪任务 */
+  getReadyTasks(plan: Plan): Task[];
+
+  /** 根据 Skill 匹配最佳 Subagent */
+  routeBySkill(task: Task): AgentRole;
+
+  /** 检查是否还有未完成工作 */
+  hasMoreWork(plan: Plan): boolean;
+}
+```
+
+### 6.3 Replanner 模块
+
+```typescript
+export class Replanner {
+  constructor(config: { model: string; maxRetries?: number });
+
+  /** 检查 Plan 健康状态 */
+  async check(plan: Plan): Promise<HealthCheck>;
+
+  /** 生成修复计划 */
+  async replan(plan: Plan, failedTasks: Task[]): Promise<Plan>;
+}
+```
+
+### 6.4 Blackboard 模块
+
+```typescript
+export class Blackboard {
+  constructor(basePath: string);
+
+  /** 写入任务结果 */
+  async writeResult(taskId: string, content: string): Promise<void>;
+
+  /** 读取任务结果 */
+  async readResult(taskId: string): Promise<string>;
+
+  /** 聚合所有已完成任务结果 */
+  async aggregateResults(taskIds: string[]): Promise<string>;
+}
+```
+
+---
+
+## 7. 完整代码实现
+
+### 7.1 插件入口（index.ts）
+
+```typescript
+// index.ts — Plan-Subagent 插件入口
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { Planner } from "./planner";
+import { TaskRouter } from "./router";
+import { Replanner } from "./replanner";
+import { Blackboard } from "./blackboard";
+
+export default definePluginEntry({
+  id: "plan-subagent",
+  name: "Plan-Subagent Orchestrator",
+
+  register(api) {
+    const config = api.config;
+    const planner = new Planner({ model: config.plannerModel || "gpt-4o-mini" });
+    const router = new TaskRouter({
+      maxConcurrency: config.maxConcurrency || 3,
+      agentPool: config.agentRoles || defaultRoles
+    });
+    const replanner = new Replanner({ model: config.replannerModel || "gpt-4o-mini" });
+    const blackboard = new Blackboard(config.workspaceDir || "./workspace");
+
+    // 1. 注册会话扩展（Plan 状态持久化）
+    api.registerSessionExtension({
+      id: "plan_state",
+      defaultValue: { id: "", status: "idle", tasks: [], createdAt: 0, updatedAt: 0 },
+      onCleanup(reason) {
+        console.log(`[Plan-Subagent] Cleanup: ${reason}`);
+      }
+    });
+
+    // 2. before_agent_reply — 复杂任务检测 + Plan 生成（短路）
+    api.on("before_agent_reply", async (event) => {
+      const complexity = await planner.classify(event.prompt);
+      if (complexity === "simple") return; // 不干预
+
+      const plan = await planner.createPlan(event.prompt);
+      await api.updateSessionExtension("plan_state", plan);
+
+      api.enqueueNextTurnInjection({
+        idempotencyKey: `plan-${plan.id}`,
+        context: `
+## 执行计划
+${planner.toMarkdown(plan)}
+
+请按照上述计划调度执行就绪任务。
+        `
+      });
+
+      return {
+        syntheticReply: `已分解为 ${plan.tasks.length} 个子任务，开始执行...`
+      };
+    }, { priority: 80 });
+
+    // 3. before_prompt_build — Plan 上下文注入
+    api.on("before_prompt_build", async (event) => {
+      const plan = await api.getSessionExtension("plan_state");
+      if (!plan || plan.status === "idle") return;
+
+      const readyTasks = router.getReadyTasks(plan);
+      if (readyTasks.length === 0) return;
+
+      return {
+        prependContext: `
+当前就绪任务（${readyTasks.length}个）：
+${readyTasks.map(t => `- ${t.id}: ${t.description} [skills: ${t.skills.join(", ")}]`).join("\n")}
+
+请调度执行上述任务，每个任务调用对应工具完成。
+        `
+      };
+    }, { priority: 70 });
+
+    // 4. subagent_delivery_target — Skill 匹配路由
+    api.on("subagent_delivery_target", async (event) => {
+      const target = router.routeBySkill(event.task);
+      return { targetAgentId: target.agentId };
+    }, { priority: 70 });
+
+    // 5. after_tool_call — 结果收集 + 状态更新
+    api.on("after_tool_call", async (event) => {
+      const plan = await api.getSessionExtension("plan_state");
+      if (!plan || plan.status === "idle") return;
+
+      // 更新对应任务状态
+      const task = plan.tasks.find(t => t.id === event.runId);
+      if (task) {
+        task.status = event.error ? "failed" : "done";
+        task.result = event.result?.content || "";
+        task.completedAt = Date.now();
+
+        // 写入 Blackboard
+        await blackboard.writeResult(task.id, task.result);
+
+        await api.updateSessionExtension("plan_state", plan);
+      }
+    });
+
+    // 6. before_agent_finalize — Replanner 重规划决策
+    api.on("before_agent_finalize", async (event) => {
+      const plan = await api.getSessionExtension("plan_state");
+      if (!plan || plan.status === "idle") return;
+
+      const health = await replanner.check(plan);
+      if (health.needsReroute) {
+        const newPlan = await replanner.replan(plan, health.failedTasks);
+        await api.updateSessionExtension("plan_state", newPlan);
+        return { action: "revise", reason: health.reason };
+      }
+
+      // 全部完成，更新状态
+      plan.status = "done";
+      await api.updateSessionExtension("plan_state", plan);
+      return { action: "finalize" };
+    }, { priority: 60 });
+
+    // 7. agent_end — 执行指标记录
+    api.on("agent_end", async (event) => {
+      console.log(`[Plan-Subagent] Agent ended: runId=${event.runId}, duration=${event.durationMs}ms, success=${event.success}`);
+    });
+  }
+});
+```
+
+### 7.2 Planner 模块（planner.ts）
+
+```typescript
+// planner.ts — 任务分解器
+import { LLM } from "openclaw/plugin-sdk/llm";
+
+export interface Task {
+  id: string;
+  description: string;
+  skills: string[];
+  dependencies: string[];
+  status: "pending" | "running" | "done" | "failed" | "skipped";
+  requiresApproval: boolean;
+  assignedAgent?: string;
+  result?: string;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+export interface Plan {
+  id: string;
+  status: "planning" | "executing" | "reviewing" | "done";
+  tasks: Task[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export class Planner {
+  private llm: LLM;
+  private maxTasks: number;
+
+  constructor(config: { model: string; maxTasks?: number }) {
+    this.llm = new LLM({ model: config.model });
+    this.maxTasks = config.maxTasks || 10;
+  }
+
+  async classify(request: string): Promise<"simple" | "complex"> {
+    const prompt = `
+判断以下用户请求是否为复杂任务（需要多步工具调用或跨领域协作）。
+复杂任务的特征：需要同时使用多种工具、涉及多个步骤、需要搜索+编码+文件操作等。
+只回复一个单词："simple" 或 "complex"。
+
+请求: ${request}
+    `;
+    const result = await this.llm.generate(prompt);
+    return result.trim().toLowerCase().includes("complex") ? "complex" : "simple";
+  }
+
+  async createPlan(request: string): Promise<Plan> {
+    const prompt = `
+将以下用户请求分解为 ${this.maxTasks} 个以内的可并行执行子任务。
+输出严格遵循以下 JSON 格式：
+{
+  "tasks": [
+    {
+      "id": "task_001",
+      "description": "任务描述",
+      "skills": ["search"],
+      "dependencies": [],
+      "requiresApproval": false
+    }
+  ]
+}
+
+规则：
+1. skills 只能从以下选项中选择: search, browser, shell, code, file
+2. dependencies 填写依赖的其他 task id，无依赖留空数组
+3. 涉及文件删除、系统命令执行等高风险操作标记 requiresApproval: true
+4. 尽量并行化：无依赖的任务应独立，不要串行化
+5. 确保依赖图无环
+
+用户请求: ${request}
+    `;
+
+    const response = await this.llm.generate({
+      prompt,
+      responseFormat: { type: "json_object" }
+    });
+
+    const parsed = JSON.parse(response);
+    const tasks: Task[] = parsed.tasks.map((t: any) => ({
+      ...t,
+      status: "pending" as const,
+      skills: t.skills || [],
+      dependencies: t.dependencies || [],
+      requiresApproval: t.requiresApproval || false
+    }));
+
+    validateDAG(tasks);
+
+    return {
+      id: `plan_${Date.now()}`,
+      status: "executing",
+      tasks,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  }
+
+  toMarkdown(plan: Plan): string {
+    const lines = [
+      `# 执行计划 (${plan.id})`,
+      "",
+      ...plan.tasks.map(t => {
+        const checkbox = t.status === "done" ? "[x]" : t.status === "failed" ? "[~]" : "[ ]";
+        const deps = t.dependencies.length > 0 ? ` (depends: ${t.dependencies.join(", ")})` : "";
+        const approval = t.requiresApproval ? " ⚠️需审批" : "";
+        return `- ${checkbox} ${t.id}: ${t.description}${deps}${approval}`;
+      })
+    ];
+    return lines.join("\n");
+  }
+}
+
+// DAG 验证（检测循环依赖）
+function validateDAG(tasks: Task[]): void {
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+  const taskMap = new Map(tasks.map(t => [t.id, t]));
+
+  function visit(id: string): boolean {
+    if (recursionStack.has(id)) return false; // 发现环
+    if (visited.has(id)) return true;
+
+    visited.add(id);
+    recursionStack.add(id);
+
+    const task = taskMap.get(id);
+    if (task) {
+      for (const dep of task.dependencies) {
+        if (!taskMap.has(dep)) {
+          throw new Error(`Task ${id} depends on non-existent task ${dep}`);
+        }
+        if (!visit(dep)) {
+          throw new Error(`Circular dependency detected involving task ${id}`);
+        }
+      }
+    }
+
+    recursionStack.delete(id);
+    return true;
+  }
+
+  for (const task of tasks) {
+    visit(task.id);
+  }
+}
+```
+
+### 7.3 TaskRouter 模块（router.ts）
+
+```typescript
+// router.ts — Skill 匹配路由
+import { Task, Plan } from "./planner";
+
+export interface AgentRole {
+  agentId: string;
+  name: string;
+  skills: string[];
+  model: string;
+}
+
+export const defaultRoles: AgentRole[] = [
+  { agentId: "researcher", name: "Researcher", skills: ["search", "browser"], model: "gpt-4o-mini" },
+  { agentId: "coder", name: "Coder", skills: ["shell", "code", "file"], model: "gpt-4o" },
+  { agentId: "browser", name: "BrowserOperator", skills: ["browser"], model: "gpt-4o-mini" },
+  { agentId: "reviewer", name: "Reviewer", skills: ["file", "code"], model: "gpt-4o-mini" }
+];
+
+export class TaskRouter {
+  private maxConcurrency: number;
+  private agentPool: AgentRole[];
+
+  constructor(config: { maxConcurrency: number; agentPool: AgentRole[] }) {
+    this.maxConcurrency = config.maxConcurrency;
+    this.agentPool = config.agentPool;
+  }
+
+  /** 获取依赖已满足的就绪任务 */
+  getReadyTasks(plan: Plan): Task[] {
+    const completedIds = new Set(
+      plan.tasks.filter(t => t.status === "done" || t.status === "skipped").map(t => t.id)
+    );
+
+    return plan.tasks.filter(t =>
+      t.status === "pending" &&
+      t.dependencies.every(depId => completedIds.has(depId))
+    );
+  }
+
+  /** 根据 Skill 匹配最佳 Subagent */
+  routeBySkill(task: Task): AgentRole {
+    // 1. 精确匹配：所有 skill 都被覆盖
+    const exactMatches = this.agentPool.filter(agent =>
+      task.skills.every(skill => agent.skills.includes(skill))
+    );
+
+    if (exactMatches.length > 0) {
+      // 选择最专精的（skill 最少但满足需求的）
+      return exactMatches.sort((a, b) => a.skills.length - b.skills.length)[0];
+    }
+
+    // 2. 最大交集匹配
+    const scored = this.agentPool.map(agent => ({
+      agent,
+      score: task.skills.filter(s => agent.skills.includes(s)).length
+    }));
+
+    scored.sort((a, b) => b.score - a.score);
+
+    if (scored[0].score === 0) {
+      // 3. 降级：返回通用角色（Coder 默认）
+      return this.agentPool.find(a => a.agentId === "coder") || this.agentPool[0];
+    }
+
+    return scored[0].agent;
+  }
+
+  /** 检查是否还有未完成工作 */
+  hasMoreWork(plan: Plan): boolean {
+    return plan.tasks.some(t => t.status === "pending" || t.status === "running");
+  }
+
+  /** 获取执行进度摘要 */
+  getProgress(plan: Plan): { total: number; done: number; failed: number; pending: number; running: number } {
+    const total = plan.tasks.length;
+    const done = plan.tasks.filter(t => t.status === "done").length;
+    const failed = plan.tasks.filter(t => t.status === "failed").length;
+    const pending = plan.tasks.filter(t => t.status === "pending").length;
+    const running = plan.tasks.filter(t => t.status === "running").length;
+    return { total, done, failed, pending, running };
+  }
+}
+```
+
+### 7.4 Replanner 模块（replanner.ts）
+
+```typescript
+// replanner.ts — 动态重规划
+import { LLM } from "openclaw/plugin-sdk/llm";
+import { Task, Plan } from "./planner";
+
+export interface HealthCheck {
+  needsReroute: boolean;
+  failedTasks: Task[];
+  reason?: string;
+}
+
+export interface RepairDecision {
+  strategy: "retry" | "decompose" | "skip" | "escalate";
+  newTasks?: Task[];
+  reason: string;
+}
+
+export class Replanner {
+  private llm: LLM;
+  private maxRetries: number;
+
+  constructor(config: { model: string; maxRetries?: number }) {
+    this.llm = new LLM({ model: config.model });
+    this.maxRetries = config.maxRetries || 3;
+  }
+
+  async check(plan: Plan): Promise<HealthCheck> {
+    const failed = plan.tasks.filter(t => t.status === "failed");
+    const running = plan.tasks.filter(t => t.status === "running");
+
+    // 全部完成
+    if (failed.length === 0 && running.length === 0 &&
+        plan.tasks.every(t => t.status === "done" || t.status === "skipped")) {
+      return { needsReroute: false, failedTasks: [] };
+    }
+
+    // 有失败任务需要重规划
+    if (failed.length > 0) {
+      const retryCount = failed.filter(t => (t as any)._retryCount || 0).length;
+      return {
+        needsReroute: true,
+        failedTasks: failed,
+        reason: `${failed.length} 个任务失败（已重试 ${retryCount} 次），需要重规划`
+      };
+    }
+
+    // 还有运行中的任务，继续等待
+    if (running.length > 0) {
+      return { needsReroute: false, failedTasks: [] };
+    }
+
+    return { needsReroute: false, failedTasks: [] };
+  }
+
+  async replan(plan: Plan, failedTasks: Task[]): Promise<Plan> {
+    const prompt = `
+以下 Plan 中有 ${failedTasks.length} 个任务执行失败。请分析失败原因并选择最佳修复策略。
+
+失败任务:
+${failedTasks.map(t => `- ${t.id}: ${t.description} (skills: ${t.skills.join(", ")})`).join("\n")}
+
+可用的修复策略：
+1. "retry" — 直接重试（适用于临时性错误：网络超时、API 限流等）
+2. "decompose" — 拆分为更小的子任务（适用于任务过大或模糊）
+3. "skip" — 标记为跳过（适用于非阻塞性可选任务）
+4. "escalate" — 需要人工介入（适用于权限不足、需要确认的操作）
+
+请输出严格 JSON：
+{
+  "strategy": "retry|decompose|skip|escalate",
+  "reason": "选择该策略的理由",
+  "newTasks": [
+    { "id": "...", "description": "...", "skills": [...], "dependencies": [...] }
+  ]
+}
+
+注意：
+- retry 策略时 newTasks 为空（直接重置失败任务状态）
+- decompose 策略时 newTasks 为拆分后的子任务
+- skip 和 escalate 策略时 newTasks 为空
+    `;
+
+    const response = await this.llm.generate({
+      prompt,
+      responseFormat: { type: "json_object" }
+    });
+
+    const decision: RepairDecision = JSON.parse(response);
+    return this.applyFix(plan, failedTasks, decision);
+  }
+
+  private applyFix(plan: Plan, failed: Task[], decision: RepairDecision): Plan {
+    switch (decision.strategy) {
+      case "retry": {
+        // 重置失败任务为 pending，增加重试计数
+        for (const task of plan.tasks) {
+          if (failed.some(f => f.id === task.id)) {
+            task.status = "pending";
+            (task as any)._retryCount = ((task as any)._retryCount || 0) + 1;
+          }
+        }
+        break;
+      }
+
+      case "decompose": {
+        // 移除失败任务，插入新的子任务
+        const failedIds = new Set(failed.map(f => f.id));
+        plan.tasks = plan.tasks.filter(t => !failedIds.has(t.id));
+        if (decision.newTasks && decision.newTasks.length > 0) {
+          const newTasks = decision.newTasks.map(t => ({
+            ...t,
+            status: "pending" as const,
+            dependencies: t.dependencies || []
+          }));
+          plan.tasks.push(...newTasks);
+        }
+        break;
+      }
+
+      case "skip": {
+        // 标记失败任务为 skipped
+        for (const task of plan.tasks) {
+          if (failed.some(f => f.id === task.id)) {
+            task.status = "skipped";
+            task.result = "[skipped by replanner]";
+          }
+        }
+        break;
+      }
+
+      case "escalate": {
+        // 标记需要审批，重置为 pending
+        for (const task of plan.tasks) {
+          if (failed.some(f => f.id === task.id)) {
+            task.status = "pending";
+            task.requiresApproval = true;
+          }
+        }
+        break;
+      }
+
+      default: {
+        // 未知策略，默认 retry
+        for (const task of plan.tasks) {
+          if (failed.some(f => f.id === task.id)) {
+            task.status = "pending";
+          }
+        }
+      }
+    }
+
+    plan.updatedAt = Date.now();
+    return plan;
+  }
+}
+```
+
+### 7.5 Blackboard 模块（blackboard.ts）
+
+```typescript
+// blackboard.ts — Markdown 驱动的共享状态
+import { mkdir, readFile, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+
+export class Blackboard {
+  private basePath: string;
+
+  constructor(basePath: string = "./workspace") {
+    this.basePath = basePath;
+  }
+
+  async writeResult(taskId: string, content: string): Promise<void> {
+    const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, content, "utf-8");
+  }
+
+  async readResult(taskId: string): Promise<string> {
+    const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
+    try {
+      return await readFile(path, "utf-8");
+    } catch {
+      return "";
+    }
+  }
+
+  async writePlan(planId: string, content: string): Promise<void> {
+    const path = join(this.basePath, "PLANS", `${planId}.md`);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, content, "utf-8");
+  }
+
+  async aggregateResults(taskIds: string[]): Promise<string> {
+    const results: string[] = [];
+    for (const id of taskIds) {
+      const content = await this.readResult(id);
+      if (content) {
+        results.push(`## Task: ${id}\n\n${content}`);
+      }
+    }
+    return results.join("\n\n---\n\n");
+  }
+}
+```
+
+---
+
+## 8. 目录结构
+
+```
+openclaw-plugin-plan-subagent/
+├── src/
+│   ├── index.ts              # 插件入口 (definePluginEntry)
+│   ├── planner.ts            # Planner: 复杂度分类 + 任务分解
+│   ├── router.ts             # TaskRouter: Skill 匹配路由
+│   ├── replanner.ts          # Replanner: revise/finalize 决策
+│   ├── blackboard.ts         # Blackboard: Markdown 状态存储
+│   └── types.ts              # 共享类型定义
+├── tests/
+│   ├── planner.test.ts       # Planner 单元测试
+│   ├── router.test.ts        # TaskRouter 单元测试
+│   ├── replanner.test.ts     # Replanner 单元测试
+│   └── integration.test.ts   # 集成测试
+├── plugin.json               # 插件元数据 + 默认配置
+├── package.json
+├── tsconfig.json
+└── README.md
+```
+
+### plugin.json
+
+```json
+{
+  "id": "plan-subagent",
+  "name": "Plan-Subagent Orchestrator",
+  "version": "1.0.0",
+  "description": "Plan-Task-Build Agent composition mode for complex task orchestration",
+  "main": "dist/index.js",
+  "hooks": {
+    "allowConversationAccess": true
+  },
+  "config": {
+    "plannerModel": "gpt-4o-mini",
+    "replannerModel": "gpt-4o-mini",
+    "maxConcurrency": 3,
+    "maxStepsPerAgent": 20,
+    "agentRoles": [
+      { "agentId": "researcher", "name": "Researcher", "skills": ["search", "browser"], "model": "gpt-4o-mini" },
+      { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
+      { "agentId": "browser", "name": "BrowserOperator", "skills": ["browser"], "model": "gpt-4o-mini" },
+      { "agentId": "reviewer", "name": "Reviewer", "skills": ["file", "code"], "model": "gpt-4o-mini" }
+    ]
+  }
+}
+```
+
+---
+
+## 9. 测试策略
+
+### 9.1 单元测试
+
+| 模块 | 测试项 | 预期结果 |
+|------|--------|---------|
+| Planner.classify | 简单请求返回 "simple" | 不干预，走正常流程 |
+| Planner.classify | 复杂请求返回 "complex" | 触发 Plan 分解 |
+| Planner.createPlan | 有效请求 | 返回无环 DAG，Task 数量合理 |
+| Planner.createPlan | 含高风险操作的请求 | requiresApproval=true |
+| TaskRouter.routeBySkill | search 任务 | 返回 researcher |
+| TaskRouter.routeBySkill | code+shell 任务 | 返回 coder |
+| TaskRouter.getReadyTasks | 依赖未满足 | 不返回该任务 |
+| Replanner.check | 全部完成 | needsReroute=false |
+| Replancer.check | 有失败任务 | needsReroute=true |
+| Replanner.applyFix | retry 策略 | 失败任务重置为 pending |
+
+### 9.2 集成测试
+
+1. **完整流程**：复杂请求 → Plan 生成 → Task 路由 → Subagent 执行 → 结果聚合 → 最终交付
+2. **重规划流程**：故意让任务失败 → Replanner 触发 → revise 决策 → 修复后 finalize
+3. **人工审批**：标记 requiresApproval 的任务 → requireApproval 暂停 → /approve 批准 → 继续执行
+4. **并发控制**：同时调度 5 个独立任务 → 只并发执行 3 个 → 完成后自动执行剩余 2 个
+
+### 9.3 边界测试
+
+- 空请求处理
+- 循环依赖检测（应抛出错误）
+- 最大任务数限制
+- Session Extension 数据过大时的行为
+- 插件卸载时状态清理
+
+---
+
+## 10. 交付标准
+
+### 10.1 功能完成度
+
+- [ ] Plan 模块：复杂度分类、任务分解、DAG 验证
+- [ ] Task 模块：Skill 匹配路由、4 个标准角色、并发控制
+- [ ] Build 模块：工具拦截、结果收集、4 种修复策略
+- [ ] 监控模块：Session Extension 状态、Heartbeat 汇报
+- [ ] 人工审批：requireApproval 集成、/approve 命令支持
+
+### 10.2 质量要求
+
+- [ ] TypeScript 严格模式，无 any 类型
+- [ ] 单元测试覆盖率 > 80%
+- [ ] 集成测试覆盖 3 条核心流程
+- [ ] 错误处理完备，所有异步操作有 try/catch
+- [ ] 日志记录关键事件，支持调试级别配置
+
+### 10.3 文档要求
+
+- [ ] README.md：安装、配置、使用方法
+- [ ] API 文档：每个公共方法的 JSDoc 注释
+- [ ] 配置文档：plugin.json 所有字段说明
+- [ ] 示例：3 个典型使用场景的对话示例
+
+---
+
+## 11. 风险提示
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| `subagent_*` 钩子 API 尚未正式发布 | 高 | 关注 OpenClaw 更新，预留适配层 |
+| 多插件钩子 priority 冲突 | 中 | 文档说明推荐 priority 范围，提供冲突检测 |
+| LLM Plan 生成不稳定 | 中 | 引入 schema validation，失败时 fallback 到单 Agent |
+| Session Extension 数据膨胀 | 中 | Plan 状态定期压缩，超大状态分片 |
+| 与核心版本兼容性 | 中 | plugin.json 声明最低版本，CI 兼容性矩阵 |
