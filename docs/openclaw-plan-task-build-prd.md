@@ -50,9 +50,14 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 
 #### FR-PLAN-001 复杂度分类
 - 插件在 `before_agent_reply` 钩子中拦截用户请求
-- 调用轻量 LLM（GPT-4o-mini）判断复杂度：simple / complex
+- **分层分类策略**（性能优化）：
+  1. **规则缓存层（L1）**：正则/关键词规则匹配常见简单请求（问候、简单查询、代码片段解释等），直接判定为 `simple`，**零 LLM 调用**
+  2. **轻量 LLM 层（L2）**：规则未命中时，调用 GPT-4o-mini 判断复杂度：simple / complex
+  3. **降级层（L3）**：LLM 调用失败时返回 `simple`，避免阻塞用户
 - simple 请求不干预，走正常 ReAct 流程
 - complex 请求触发 Plan 分解流程
+- **配置项**：`skipClassification: boolean`，允许用户完全跳过分类，所有请求直接按 `complex` 处理（适用于已知高频复杂任务场景）
+- **规则缓存可配置**：支持用户自定义规则列表，定期自动刷新
 
 #### FR-PLAN-002 任务分解
 - 调用 LLM 将用户请求分解为结构化 Task List
@@ -150,6 +155,31 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 - 关键事件记录：Plan 生成、Task 路由、Subagent 启动/结束、重规划决策
 - 通过 `agent_end` 收集执行时长和成功/失败统计
 
+### 3.5 配置热更新模块
+
+#### FR-CONFIG-001 生命周期钩子管理
+- 利用 OpenClaw 的 `gateway_start` / `gateway_stop` 钩子实现配置热更新
+- `gateway_start`：加载并缓存当前配置，初始化 Planner / TaskRouter / Replanner 实例
+- `gateway_stop`：保存当前运行状态，清理资源，准备重新加载
+
+#### FR-CONFIG-002 配置变更检测
+- 监听配置文件变更（如 plugin.json 修改）
+- 变更时触发 `gateway_stop` → `gateway_start` 序列重新加载配置
+- 正在执行的 Plan 不受影响，新配置仅对后续请求生效
+
+#### FR-CONFIG-003 差异化重载策略
+| 配置项 | 变更影响 | 重载策略 |
+|--------|----------|----------|
+| `plannerModel` / `replannerModel` | 影响后续 Plan 生成 | 立即生效 |
+| `maxConcurrency` | 影响并发控制 | 立即生效（不中断运行中任务） |
+| `agentRoles` | 影响 Task 路由 | 立即生效 |
+| `classificationRules` | 影响分类性能 | 立即生效，清空规则缓存 |
+| `skipClassification` | 影响分类流程 | 立即生效 |
+
+#### FR-CONFIG-004 配置验证
+- 重载前对配置进行 Schema 验证（使用 Zod）
+- 无效配置拒绝加载，保持旧配置运行，记录错误日志
+
 ---
 
 ## 4. 技术架构
@@ -198,6 +228,8 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 
 | 优先级 | 钩子 | 用途 | 返回值 |
 |--------|------|------|--------|
+| 90 | `gateway_start` | 配置加载与初始化 | — |
+| 90 | `gateway_stop` | 配置卸载与状态保存 | — |
 | 80 | `before_agent_reply` | 复杂任务检测 + Plan 生成 | `{ syntheticReply }` 或空（直接执行） |
 | 70 | `before_prompt_build` | Plan 上下文注入 Prompt | `{ prependContext }` |
 | 70 | `subagent_delivery_target` | Task → Subagent 路由 | `{ targetAgentId }` |
@@ -276,6 +308,12 @@ interface HealthCheck {
           "replannerModel": "gpt-4o-mini",
           "maxConcurrency": 3,
           "maxStepsPerAgent": 20,
+          "skipClassification": false,
+          "classificationRules": [
+            { "pattern": "^(hello|hi|hey|你好|您好)", "result": "simple" },
+            { "pattern": "^(what|who|when|where|为什么|什么是)", "result": "simple" },
+            { "pattern": "^(explain|解释|说明).{0,50}$", "result": "simple" }
+          ],
           "agentRoles": [
             {
               "agentId": "researcher",
@@ -320,10 +358,18 @@ interface HealthCheck {
 
 ```typescript
 export class Planner {
-  constructor(config: { model: string; maxTasks?: number });
+  constructor(config: { 
+    model: string; 
+    maxTasks?: number;
+    skipClassification?: boolean;
+    classificationRules?: Array<{ pattern: string; result: "simple" | "complex" }>;
+  });
 
-  /** 判断请求复杂度 */
+  /** 判断请求复杂度（三层策略：规则缓存 → LLM → 降级） */
   async classify(request: string): Promise<"simple" | "complex">;
+
+  /** 规则缓存匹配（L1 层） */
+  matchRule(request: string): "simple" | "complex" | null;
 
   /** 生成任务分解 Plan */
   async createPlan(request: string): Promise<Plan>;
@@ -368,7 +414,12 @@ export class Replanner {
 
 ```typescript
 export class Blackboard {
-  constructor(basePath: string);
+  constructor(config: {
+    basePath: string;
+    metricsOutput?: "blackboard" | "webhook" | "otel" | "none";
+    metricsWebhook?: string; // webhook URL (当 metricsOutput="webhook" 时必填)
+    metricsOtelEndpoint?: string; // OpenTelemetry endpoint (当 metricsOutput="otel" 时必填)
+  });
 
   /** 写入任务结果 */
   async writeResult(taskId: string, content: string): Promise<void>;
@@ -378,6 +429,9 @@ export class Blackboard {
 
   /** 聚合所有已完成任务结果 */
   async aggregateResults(taskIds: string[]): Promise<string>;
+
+  /** 写入指标（根据配置输出到 Blackboard、Webhook 或 OpenTelemetry） */
+  async writeMetrics(runId: string, metrics: Record<string, unknown>): Promise<void>;
 }
 ```
 
@@ -416,8 +470,8 @@ export default definePluginEntry({
       defaultValue: { id: "", status: "idle", tasks: [], taskRunMap: {}, createdAt: 0, updatedAt: 0 },
       onCleanup(reason) {
         console.log(`[Plan-Subagent] Cleanup: ${reason}`);
-        // 清理 Blackboard 临时文件
-        blackboard.cleanup();
+        // 根据清理原因差异化清理 Blackboard 临时文件
+        blackboard.cleanup(reason);
       }
     });
 
@@ -670,6 +724,8 @@ ${readyTasks.map(t => `- ${t.id}: ${t.description} [skills: ${t.skills.join(", "
 ```typescript
 // planner.ts — 任务分解器
 import { LLM } from "openclaw/plugin-sdk/llm";
+import { z } from "zod";
+import { validateDAG } from "./utils/dag";
 
 export interface Task {
   id: string;
@@ -693,26 +749,18 @@ export interface Plan {
   updatedAt: number;
 }
 
-// JSON Schema 用于验证 LLM 返回的任务分解结果
-const TaskSchema = {
-  type: "object",
-  properties: {
-    id: { type: "string", pattern: "^task_[0-9]+$" },
-    description: { type: "string", minLength: 1 },
-    skills: { type: "array", items: { type: "string", enum: ["search", "browser", "shell", "code", "file"] } },
-    dependencies: { type: "array", items: { type: "string" } },
-    requiresApproval: { type: "boolean" }
-  },
-  required: ["id", "description", "skills", "dependencies"]
-};
+// Zod Schema 用于验证 LLM 返回的任务分解结果
+const TaskSchema = z.object({
+  id: z.string().regex(/^task_[0-9]+$/),
+  description: z.string().min(1),
+  skills: z.array(z.enum(["search", "browser", "shell", "code", "file"])),
+  dependencies: z.array(z.string()),
+  requiresApproval: z.boolean().optional().default(false)
+});
 
-const PlanSchema = {
-  type: "object",
-  properties: {
-    tasks: { type: "array", items: TaskSchema, minItems: 1 }
-  },
-  required: ["tasks"]
-};
+const PlanSchema = z.object({
+  tasks: z.array(TaskSchema).min(1)
+});
 
 export class Planner {
   private llm: LLM;
@@ -774,14 +822,14 @@ export class Planner {
         responseFormat: { type: "json_object" }
       });
 
-      // JSON Schema 验证
+      // Zod Schema 严格验证
       const parsed = this.validateAndParseJSON(response);
       const tasks: Task[] = parsed.tasks.map((t) => ({
         ...t,
         status: "pending" as const,
-        skills: t.skills || [],
-        dependencies: t.dependencies || [],
-        requiresApproval: t.requiresApproval || false
+        skills: t.skills,
+        dependencies: t.dependencies,
+        requiresApproval: t.requiresApproval
       }));
 
       validateDAG(tasks);
@@ -815,7 +863,7 @@ export class Planner {
     }
   }
 
-  private validateAndParseJSON(response: string): { tasks: Array<Record<string, unknown>> } {
+  private validateAndParseJSON(response: string): z.infer<typeof PlanSchema> {
     let parsed: unknown;
     try {
       parsed = JSON.parse(response);
@@ -823,23 +871,13 @@ export class Planner {
       throw new Error("Invalid JSON response from LLM");
     }
 
-    // 基础结构验证
-    if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, unknown>).tasks)) {
-      throw new Error("Response missing tasks array");
+    // Zod Schema 严格验证
+    const result = PlanSchema.safeParse(parsed);
+    if (!result.success) {
+      throw new Error(`Schema validation failed: ${result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join(', ')}`);
     }
 
-    const tasks = (parsed as Record<string, unknown>).tasks;
-    for (const task of tasks) {
-      if (!task || typeof task !== "object") {
-        throw new Error("Invalid task structure");
-      }
-      const t = task as Record<string, unknown>;
-      if (!t.id || !t.description || !Array.isArray(t.skills) || !Array.isArray(t.dependencies)) {
-        throw new Error(`Task missing required fields: ${JSON.stringify(task)}`);
-      }
-    }
-
-    return parsed as { tasks: Array<Record<string, unknown>> };
+    return result.data;
   }
 
   toMarkdown(plan: Plan): string {
@@ -854,40 +892,6 @@ export class Planner {
       })
     ];
     return lines.join("\n");
-  }
-}
-
-// DAG 验证（检测循环依赖）
-function validateDAG(tasks: Task[]): void {
-  const visited = new Set<string>();
-  const recursionStack = new Set<string>();
-  const taskMap = new Map(tasks.map(t => [t.id, t]));
-
-  function visit(id: string): boolean {
-    if (recursionStack.has(id)) return false; // 发现环
-    if (visited.has(id)) return true;
-
-    visited.add(id);
-    recursionStack.add(id);
-
-    const task = taskMap.get(id);
-    if (task) {
-      for (const dep of task.dependencies) {
-        if (!taskMap.has(dep)) {
-          throw new Error(`Task ${id} depends on non-existent task ${dep}`);
-        }
-        if (!visit(dep)) {
-          throw new Error(`Circular dependency detected involving task ${id}`);
-        }
-      }
-    }
-
-    recursionStack.delete(id);
-    return true;
-  }
-
-  for (const task of tasks) {
-    visit(task.id);
   }
 }
 ```
@@ -1160,7 +1164,97 @@ ${failedTasks.map(t => `- ${t.id}: ${t.description} (skills: ${t.skills.join(", 
 }
 ```
 
-### 7.5 Blackboard 模块（blackboard.ts）
+### 7.5 DAG 工具模块（utils/dag.ts）
+
+```typescript
+// utils/dag.ts — DAG 验证工具（独立模块，方便测试复用）
+import { Task } from "../types";
+
+/** 验证任务依赖图是否为无环有向图（DAG） */
+export function validateDAG(tasks: Task[]): void {
+  const visited = new Set<string>();
+  const recursionStack = new Set<string>();
+  const taskMap = new Map(tasks.map(t => [t.id, t]));
+
+  function visit(id: string): boolean {
+    if (recursionStack.has(id)) return false; // 发现环
+    if (visited.has(id)) return true;
+
+    visited.add(id);
+    recursionStack.add(id);
+
+    const task = taskMap.get(id);
+    if (task) {
+      for (const dep of task.dependencies) {
+        if (!taskMap.has(dep)) {
+          throw new Error(`Task ${id} depends on non-existent task ${dep}`);
+        }
+        if (!visit(dep)) {
+          throw new Error(`Circular dependency detected involving task ${id}`);
+        }
+      }
+    }
+
+    recursionStack.delete(id);
+    return true;
+  }
+
+  for (const task of tasks) {
+    visit(task.id);
+  }
+}
+
+/** 检测是否存在循环依赖（返回布尔值，不抛出异常） */
+export function hasCircularDependency(tasks: Task[]): boolean {
+  try {
+    validateDAG(tasks);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** 获取任务的拓扑排序（执行顺序） */
+export function topologicalSort(tasks: Task[]): string[] {
+  validateDAG(tasks);
+  
+  const inDegree = new Map<string, number>();
+  const adjList = new Map<string, string[]>();
+  
+  for (const task of tasks) {
+    inDegree.set(task.id, 0);
+    adjList.set(task.id, []);
+  }
+  
+  for (const task of tasks) {
+    for (const dep of task.dependencies) {
+      adjList.get(dep)?.push(task.id);
+      inDegree.set(task.id, (inDegree.get(task.id) || 0) + 1);
+    }
+  }
+  
+  const queue: string[] = [];
+  for (const [id, degree] of inDegree) {
+    if (degree === 0) queue.push(id);
+  }
+  
+  const result: string[] = [];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    result.push(id);
+    
+    for (const next of adjList.get(id) || []) {
+      const newDegree = (inDegree.get(next) || 0) - 1;
+      inDegree.set(next, newDegree);
+      if (newDegree === 0) queue.push(next);
+    }
+  }
+  
+  return result;
+}
+```
+
+### 7.6 Blackboard 模块（blackboard.ts）
 
 ```typescript
 // blackboard.ts — Markdown 驱动的共享状态
@@ -1169,9 +1263,20 @@ import { dirname, join } from "path";
 
 export class Blackboard {
   private basePath: string;
+  private metricsOutput: "blackboard" | "webhook" | "otel" | "none";
+  private metricsWebhook?: string;
+  private metricsOtelEndpoint?: string;
 
-  constructor(basePath: string = "./workspace") {
-    this.basePath = basePath;
+  constructor(config: {
+    basePath?: string;
+    metricsOutput?: "blackboard" | "webhook" | "otel" | "none";
+    metricsWebhook?: string;
+    metricsOtelEndpoint?: string;
+  } = {}) {
+    this.basePath = config.basePath || "./workspace";
+    this.metricsOutput = config.metricsOutput || "blackboard";
+    this.metricsWebhook = config.metricsWebhook;
+    this.metricsOtelEndpoint = config.metricsOtelEndpoint;
   }
 
   async writeResult(taskId: string, content: string): Promise<void> {
@@ -1203,11 +1308,48 @@ export class Blackboard {
     }
   }
 
-  async writeMetrics(runId: string, content: string): Promise<void> {
+  async writeMetrics(runId: string, metrics: Record<string, unknown>): Promise<void> {
     try {
+      // 1. Blackboard 本地写入（始终执行，作为兜底）
       const path = join(this.basePath, "METRICS", `${runId}.json`);
       await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, content, "utf-8");
+      await writeFile(path, JSON.stringify(metrics, null, 2), "utf-8");
+
+      // 2. Webhook 输出
+      if (this.metricsOutput === "webhook" && this.metricsWebhook) {
+        await fetch(this.metricsWebhook, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runId, ...metrics, timestamp: Date.now() })
+        });
+      }
+
+      // 3. OpenTelemetry 输出（简化实现，实际接入 OTel SDK）
+      if (this.metricsOutput === "otel" && this.metricsOtelEndpoint) {
+        await fetch(this.metricsOtelEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            resourceMetrics: [{
+              scopeMetrics: [{
+                metrics: [{
+                  name: "plan_subagent_execution",
+                  sum: {
+                    dataPoints: [{
+                      attributes: [
+                        { key: "runId", value: { stringValue: runId } },
+                        { key: "success", value: { boolValue: metrics.success } }
+                      ],
+                      timeUnixNano: Date.now() * 1e6,
+                      asDouble: metrics.durationMs as number
+                    }]
+                  }
+                }]
+              }]
+            }]
+          })
+        });
+      }
     } catch (error) {
       console.error(`[Blackboard] Failed to write metrics for ${runId}:`, error);
     }
@@ -1224,18 +1366,48 @@ export class Blackboard {
     return results.join("\n\n---\n\n");
   }
 
-  /** 清理临时文件 */
-  async cleanup(): Promise<void> {
+  /** 根据清理原因差异化清理临时文件 */
+  async cleanup(reason: "reset" | "delete" | "disable" | "restart" = "reset"): Promise<void> {
     try {
       const { rm } = await import("fs/promises");
-      // 清理 WORKSPACE 和 METRICS 目录中的临时文件
       const workspacePath = join(this.basePath, "WORKSPACE");
       const metricsPath = join(this.basePath, "METRICS");
-      
-      await rm(workspacePath, { recursive: true, force: true });
-      await rm(metricsPath, { recursive: true, force: true });
-      
-      console.log("[Blackboard] Cleanup completed");
+      const plansPath = join(this.basePath, "PLANS");
+
+      switch (reason) {
+        case "reset": {
+          // 清空 WORKSPACE 和 METRICS，保留 PLANS（历史记录）
+          await rm(workspacePath, { recursive: true, force: true });
+          await rm(metricsPath, { recursive: true, force: true });
+          console.log("[Blackboard] Cleanup (reset): WORKSPACE and METRICS cleared, PLANS preserved");
+          break;
+        }
+        case "delete": {
+          // 清空所有目录（完全卸载）
+          await rm(workspacePath, { recursive: true, force: true });
+          await rm(metricsPath, { recursive: true, force: true });
+          await rm(plansPath, { recursive: true, force: true });
+          console.log("[Blackboard] Cleanup (delete): All directories cleared");
+          break;
+        }
+        case "disable": {
+          // 不做清理，仅标记状态（保留所有数据以便重新启用）
+          console.log("[Blackboard] Cleanup (disable): No cleanup performed, data preserved");
+          break;
+        }
+        case "restart": {
+          // 清空 WORKSPACE 和 METRICS，保留 PLANS（与 reset 相同，但语义不同）
+          await rm(workspacePath, { recursive: true, force: true });
+          await rm(metricsPath, { recursive: true, force: true });
+          console.log("[Blackboard] Cleanup (restart): WORKSPACE and METRICS cleared, PLANS preserved for continuity");
+          break;
+        }
+        default: {
+          console.log(`[Blackboard] Cleanup: Unknown reason '${reason}', defaulting to reset`);
+          await rm(workspacePath, { recursive: true, force: true });
+          await rm(metricsPath, { recursive: true, force: true });
+        }
+      }
     } catch (error) {
       console.error("[Blackboard] Cleanup failed:", error);
     }
@@ -1255,7 +1427,9 @@ openclaw-plugin-plan-subagent/
 │   ├── router.ts             # TaskRouter: Skill 匹配路由 + 并发控制
 │   ├── replanner.ts          # Replanner: revise/finalize 决策 + 错误恢复
 │   ├── blackboard.ts         # Blackboard: Markdown 状态存储 + 指标收集
-│   └── types.ts              # 共享类型定义（Plan, Task, AgentRole 等）
+│   ├── types.ts              # 共享类型定义（Plan, Task, AgentRole 等）
+│   └── utils/
+│       └── dag.ts            # DAG 验证工具（循环依赖检测，独立模块）
 ├── tests/
 │   ├── planner.test.ts       # Planner 单元测试（含降级场景）
 │   ├── router.test.ts        # TaskRouter 单元测试（含并发限制）
@@ -1285,6 +1459,15 @@ openclaw-plugin-plan-subagent/
     "replannerModel": "gpt-4o-mini",
     "maxConcurrency": 3,
     "maxStepsPerAgent": 20,
+    "skipClassification": false,
+    "classificationRules": [
+      { "pattern": "^(hello|hi|hey|你好|您好)", "result": "simple" },
+      { "pattern": "^(what|who|when|where|为什么|什么是)", "result": "simple" },
+      { "pattern": "^(explain|解释|说明).{0,50}$", "result": "simple" }
+    ],
+    "metricsOutput": "blackboard",
+    "metricsWebhook": "",
+    "metricsOtelEndpoint": "",
     "agentRoles": [
       { "agentId": "researcher", "name": "Researcher", "skills": ["search", "browser"], "model": "gpt-4o-mini" },
       { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
@@ -1310,6 +1493,10 @@ openclaw-plugin-plan-subagent/
 | Planner.createPlan | 含高风险操作的请求 | requiresApproval=true |
 | Planner.createPlan | LLM 返回无效 JSON | 降级为单任务 Plan |
 | Planner.createPlan | JSON Schema 验证失败 | 抛出明确的错误信息 |
+| DAGUtils.validateDAG | 无环依赖图 | 正常通过 |
+| DAGUtils.validateDAG | 循环依赖 | 抛出 Circular dependency 错误 |
+| DAGUtils.hasCircularDependency | 含环图 | 返回 true |
+| DAGUtils.topologicalSort | 有效 DAG | 返回正确的拓扑排序 |
 | TaskRouter.routeBySkill | search 任务 | 返回 researcher |
 | TaskRouter.routeBySkill | code+shell 任务 | 返回 coder |
 | TaskRouter.getReadyTasks | 依赖未满足 | 不返回该任务 |
@@ -1321,7 +1508,13 @@ openclaw-plugin-plan-subagent/
 | Replanner.applyFix | retry 策略 | 失败任务重置为 pending，_retryCount 递增 |
 | Replanner.applyFix | decompose 策略 | 移除失败任务，插入新子任务 |
 | Blackboard.writeResult | 正常写入 | 文件正确写入 WORKSPACE 目录 |
-| Blackboard.cleanup | 调用清理 | 临时文件被正确删除 |
+| Blackboard.cleanup | reset 原因 | 清空 WORKSPACE 和 METRICS，保留 PLANS |
+| Blackboard.cleanup | delete 原因 | 清空所有目录 |
+| Blackboard.cleanup | disable 原因 | 不清理，仅标记状态 |
+| Blackboard.cleanup | restart 原因 | 清空 WORKSPACE 和 METRICS，保留 PLANS |
+| Blackboard.writeMetrics | metricsOutput=blackboard | 写入本地 METRICS 目录 |
+| Blackboard.writeMetrics | metricsOutput=webhook | 发送到配置的 webhook URL |
+| Blackboard.writeMetrics | metricsOutput=otel | 发送到 OpenTelemetry endpoint |
 
 ### 9.2 集成测试
 
@@ -1331,18 +1524,22 @@ openclaw-plugin-plan-subagent/
 4. **并发控制**：同时调度 5 个独立任务 → subagent_spawning 限制为 3 个 → 完成后自动执行剩余 2 个
 5. **错误恢复**：LLM 调用失败 → 降级到 simple 流程或单任务 Plan → 正常执行
 6. **状态持久化**：Session Extension 正确读写 → taskRunMap 映射建立和清理 → 跨轮次状态保持
+7. **配置热更新**：修改 plugin.json → gateway_stop/gateway_start 序列重载 → 新配置对后续请求生效
 
 ### 9.3 边界测试
 
 - 空请求处理
+- 规则缓存命中（直接返回 simple，无 LLM 调用）
+- skipClassification=true 时所有请求直接走 complex 流程
 - 循环依赖检测（应抛出错误）
 - 最大任务数限制
 - Session Extension 数据过大时的行为
-- 插件卸载时状态清理（Blackboard cleanup 调用）
+- 插件卸载时状态清理（Blackboard cleanup 差异化策略）
 - LLM 返回格式异常（非 JSON、缺失字段、非法 skill）
 - 并发数达到上限时的排队行为
 - runId 与 taskId 映射不存在时的容错处理
 - 网络超时和 API 限流场景
+- 配置热更新时正在执行的 Plan 不受影响
 
 ---
 
@@ -1409,8 +1606,12 @@ openclaw-plugin-plan-subagent/
 - `heartbeat_prompt_contribution`：执行进度汇报（任务总数/已完成/失败/进行中/等待中）
 
 #### 监控完善
-- **结构化指标**：`agent_end` 中将执行指标结构化写入 `Blackboard.writeMetrics()`
-- **Cleanup 逻辑**：`registerSessionExtension` 的 `onCleanup` 调用 `blackboard.cleanup()` 清理临时文件
+- **结构化指标**：`agent_end` 中将执行指标结构化写入 `Blackboard.writeMetrics()`，支持 Blackboard 本地文件、Webhook、OpenTelemetry 三种输出方式
+- **Cleanup 逻辑**：`registerSessionExtension` 的 `onCleanup` 根据 `reason` 参数差异化清理：
+  - `reset`：清空 WORKSPACE 和 METRICS，保留 PLANS
+  - `delete`：清空所有目录
+  - `disable`：不做清理，仅标记状态
+  - `restart`：清空 WORKSPACE 和 METRICS，保留 PLANS
 
 ---
 
