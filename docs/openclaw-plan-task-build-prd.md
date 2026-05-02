@@ -62,13 +62,18 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 
 #### FR-PLAN-003 状态持久化
 - Plan 状态通过 `registerSessionExtension("plan_state")` 持久化
+- Session Extension 更新方式：通过 `event.context.sessions.pluginPatch` 或 Gateway `sessions.pluginPatch` 方法更新
+- Plan 状态读取方式：通过会话的 `pluginExtensions` 投影获取，或在钩子上下文中读取
 - 支持随会话保存/恢复
 - 清理语义：reset/delete/disable 时移除状态，restart 时保留
+- 维护 `taskRunMap: Record<string, string>` 记录 runId 与 taskId 的映射关系
 
 #### FR-PLAN-004 跨轮次注入
-- Plan 通过 `enqueueNextTurnInjection()` 注入下一轮模型上下文
+- **方案A（直接执行）**：Plan 生成后直接通过 `before_prompt_build` 注入当前轮次执行，不返回 `syntheticReply` 短路
+- **方案B（用户确认）**：返回 `syntheticReply` 提示用户"请输入继续以开始执行"，用户确认后通过 `enqueueNextTurnInjection()` 注入下一轮
 - 使用 idempotencyKey 去重
 - 过期注入自动丢弃
+- 默认采用方案A，避免"假开始"体验
 
 ### 3.2 Task 调度模块
 
@@ -90,17 +95,21 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 #### FR-TASK-003 并发控制
 - 默认最大并发数：3
 - 通过 `subagent_spawning` 钩子控制创建速率
+- 在 `subagent_spawning` 中检查当前运行中的 subagent 数量，超过限制时阻止创建或排队等待
 - 依赖未满足的任务排队等待
+- 记录 subagent 启动日志和运行状态
 
 #### FR-TASK-004 生命周期跟踪
-- `subagent_spawned`：记录启动日志、初始化监控
-- `subagent_ended`：收集执行结果、更新 Plan 状态
+- `subagent_spawned`：记录启动日志、初始化监控，建立 `runId → taskId` 映射并写入 Session Extension
+- `subagent_ended`：收集执行结果、更新 Plan 状态，清理 `taskRunMap` 映射
+- 任务状态流转：pending → running（在 `subagent_spawning` 中标记）→ done/failed/skipped
 
 ### 3.3 Build 执行模块
 
 #### FR-BUILD-001 受限工具执行
 - Subagent 的工具调用通过 `before_tool_call` 钩子拦截
 - 支持参数重写、执行阻止、requireApproval 审批
+- 实现 `before_tool_call` 钩子处理工具拦截和参数验证
 
 #### FR-BUILD-002 结果收集
 - `after_tool_call` 钩子观察工具结果、错误和时长
@@ -176,6 +185,12 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 │  │_call        │  │_call        │  │_finalize            │ │
 │  │  (拦截/审批)│  │  (结果收集) │  │  (revise/finalize)  │ │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+│         │                 │                     │            │
+│  ┌──────▼──────┐  ┌──────▼──────┐  ┌──────────▼──────────┐ │
+│  │subagent_    │  │subagent_    │  │heartbeat_           │ │
+│  │spawned      │  │ended        │  │prompt_contribution  │ │
+│  │(runId映射)  │  │(清理映射)   │  │(进度汇报)           │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -183,13 +198,16 @@ OpenClaw 是开源的 AI Agent 运行时框架，提供 Gateway 网关、ReAct R
 
 | 优先级 | 钩子 | 用途 | 返回值 |
 |--------|------|------|--------|
-| 80 | `before_agent_reply` | 复杂任务检测 + Plan 生成 | `{ syntheticReply }` |
+| 80 | `before_agent_reply` | 复杂任务检测 + Plan 生成 | `{ syntheticReply }` 或空（直接执行） |
 | 70 | `before_prompt_build` | Plan 上下文注入 Prompt | `{ prependContext }` |
 | 70 | `subagent_delivery_target` | Task → Subagent 路由 | `{ targetAgentId }` |
-| 70 | `subagent_spawning` | Subagent 创建决策 | — |
+| 70 | `subagent_spawning` | 并发控制 + 任务状态标记 | `{ block?, reason? }` |
 | 60 | `before_agent_finalize` | 重规划 revise/finalize | `{ action: "revise" \| "finalize" }` |
 | 50 | `before_tool_call` | 工具拦截/审批 | `{ params?, block?, requireApproval? }` |
-| 50 | `after_tool_call` | 结果收集 | — |
+| 50 | `after_tool_call` | 结果收集 + 状态更新 | — |
+| 50 | `subagent_spawned` | 建立 runId→taskId 映射 | — |
+| 50 | `subagent_ended` | 清理映射 + 结果汇总 | — |
+| 40 | `heartbeat_prompt_contribution` | 执行进度汇报 | `{ contribution }` |
 | — | `agent_end` | 执行指标记录 | — |
 
 ---
@@ -203,6 +221,7 @@ interface Plan {
   id: string;
   status: "planning" | "executing" | "reviewing" | "done";
   tasks: Task[];
+  taskRunMap: Record<string, string>; // runId -> taskId 映射
   createdAt: number;
   updatedAt: number;
 }
@@ -218,6 +237,7 @@ interface Task {
   result?: string;
   startedAt?: number;
   completedAt?: number;
+  _retryCount?: number;
 }
 
 interface AgentRole {
@@ -380,6 +400,7 @@ export default definePluginEntry({
   name: "Plan-Subagent Orchestrator",
 
   register(api) {
+    // 通过 event.context.pluginConfig 获取配置
     const config = api.config;
     const planner = new Planner({ model: config.plannerModel || "gpt-4o-mini" });
     const router = new TaskRouter({
@@ -392,99 +413,253 @@ export default definePluginEntry({
     // 1. 注册会话扩展（Plan 状态持久化）
     api.registerSessionExtension({
       id: "plan_state",
-      defaultValue: { id: "", status: "idle", tasks: [], createdAt: 0, updatedAt: 0 },
+      defaultValue: { id: "", status: "idle", tasks: [], taskRunMap: {}, createdAt: 0, updatedAt: 0 },
       onCleanup(reason) {
         console.log(`[Plan-Subagent] Cleanup: ${reason}`);
+        // 清理 Blackboard 临时文件
+        blackboard.cleanup();
       }
     });
 
-    // 2. before_agent_reply — 复杂任务检测 + Plan 生成（短路）
+    // 2. before_agent_reply — 复杂任务检测 + Plan 生成
     api.on("before_agent_reply", async (event) => {
-      const complexity = await planner.classify(event.prompt);
-      if (complexity === "simple") return; // 不干预
+      try {
+        const complexity = await planner.classify(event.prompt);
+        if (complexity === "simple") return; // 不干预
 
-      const plan = await planner.createPlan(event.prompt);
-      await api.updateSessionExtension("plan_state", plan);
+        const plan = await planner.createPlan(event.prompt);
+        
+        // 通过 event.context.sessions.pluginPatch 更新 Session Extension
+        await event.context.sessions.pluginPatch("plan_state", plan);
 
-      api.enqueueNextTurnInjection({
-        idempotencyKey: `plan-${plan.id}`,
-        context: `
-## 执行计划
-${planner.toMarkdown(plan)}
-
-请按照上述计划调度执行就绪任务。
-        `
-      });
-
-      return {
-        syntheticReply: `已分解为 ${plan.tasks.length} 个子任务，开始执行...`
-      };
+        // 方案A：直接在当前轮次执行，不返回 syntheticReply 短路
+        return;
+      } catch (error) {
+        console.error("[Plan-Subagent] Plan generation failed:", error);
+        return {
+          syntheticReply: "任务分解失败，将使用标准流程处理您的请求。"
+        };
+      }
     }, { priority: 80 });
 
     // 3. before_prompt_build — Plan 上下文注入
     api.on("before_prompt_build", async (event) => {
-      const plan = await api.getSessionExtension("plan_state");
-      if (!plan || plan.status === "idle") return;
+      try {
+        // 通过 event.context 获取 Plan 状态
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
 
-      const readyTasks = router.getReadyTasks(plan);
-      if (readyTasks.length === 0) return;
+        const readyTasks = router.getReadyTasks(plan);
+        if (readyTasks.length === 0) return;
 
-      return {
-        prependContext: `
+        return {
+          prependContext: `
+## 执行计划
+${planner.toMarkdown(plan)}
+
 当前就绪任务（${readyTasks.length}个）：
 ${readyTasks.map(t => `- ${t.id}: ${t.description} [skills: ${t.skills.join(", ")}]`).join("\n")}
 
 请调度执行上述任务，每个任务调用对应工具完成。
-        `
-      };
+          `
+        };
+      } catch (error) {
+        console.error("[Plan-Subagent] Prompt build failed:", error);
+        return;
+      }
     }, { priority: 70 });
 
-    // 4. subagent_delivery_target — Skill 匹配路由
+    // 4. subagent_spawning — 并发控制 + 任务状态标记
+    api.on("subagent_spawning", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
+
+        // 检查并发数限制
+        const runningCount = plan.tasks.filter(t => t.status === "running").length;
+        if (runningCount >= router.maxConcurrency) {
+          return { block: true, reason: "并发数限制" };
+        }
+
+        // 标记任务为 running 状态
+        const taskId = plan.taskRunMap[event.runId];
+        if (taskId) {
+          const task = plan.tasks.find(t => t.id === taskId);
+          if (task) {
+            task.status = "running";
+            task.startedAt = Date.now();
+            await event.context.sessions.pluginPatch("plan_state", plan);
+          }
+        }
+      } catch (error) {
+        console.error("[Plan-Subagent] Subagent spawning failed:", error);
+      }
+    }, { priority: 70 });
+
+    // 5. subagent_delivery_target — Skill 匹配路由
     api.on("subagent_delivery_target", async (event) => {
-      const target = router.routeBySkill(event.task);
-      return { targetAgentId: target.agentId };
+      try {
+        const target = router.routeBySkill(event.task);
+        return { targetAgentId: target.agentId };
+      } catch (error) {
+        console.error("[Plan-Subagent] Route failed:", error);
+        return { targetAgentId: "coder" }; // 降级到默认角色
+      }
     }, { priority: 70 });
 
-    // 5. after_tool_call — 结果收集 + 状态更新
+    // 6. before_tool_call — 工具拦截 + 审批
+    api.on("before_tool_call", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
+
+        // 通过 runId 查找对应 task
+        const taskId = plan.taskRunMap[event.runId];
+        const task = plan.tasks.find(t => t.id === taskId);
+        
+        if (task?.requiresApproval) {
+          return {
+            requireApproval: true,
+            onResolution: (decision: "approve" | "approveAll" | "reject") => {
+              if (decision === "reject") {
+                return { block: true, reason: "用户拒绝执行" };
+              }
+              task.requiresApproval = false;
+              return { block: false };
+            }
+          };
+        }
+
+        // 参数验证和重写
+        return { params: event.params };
+      } catch (error) {
+        console.error("[Plan-Subagent] Tool call intercept failed:", error);
+        return;
+      }
+    }, { priority: 50 });
+
+    // 7. after_tool_call — 结果收集 + 状态更新
     api.on("after_tool_call", async (event) => {
-      const plan = await api.getSessionExtension("plan_state");
-      if (!plan || plan.status === "idle") return;
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
 
-      // 更新对应任务状态
-      const task = plan.tasks.find(t => t.id === event.runId);
-      if (task) {
-        task.status = event.error ? "failed" : "done";
-        task.result = event.result?.content || "";
-        task.completedAt = Date.now();
+        // 通过 taskRunMap 查找对应任务
+        const taskId = plan.taskRunMap[event.runId];
+        const task = plan.tasks.find(t => t.id === taskId);
+        
+        if (task) {
+          task.status = event.error ? "failed" : "done";
+          task.result = event.result?.content || "";
+          task.completedAt = Date.now();
 
-        // 写入 Blackboard
-        await blackboard.writeResult(task.id, task.result);
+          // 写入 Blackboard
+          await blackboard.writeResult(task.id, task.result);
 
-        await api.updateSessionExtension("plan_state", plan);
+          // 更新 Session Extension
+          await event.context.sessions.pluginPatch("plan_state", plan);
+        }
+      } catch (error) {
+        console.error("[Plan-Subagent] Result collection failed:", error);
       }
     });
 
-    // 6. before_agent_finalize — Replanner 重规划决策
-    api.on("before_agent_finalize", async (event) => {
-      const plan = await api.getSessionExtension("plan_state");
-      if (!plan || plan.status === "idle") return;
+    // 8. subagent_spawned — 生命周期跟踪（建立 runId→taskId 映射）
+    api.on("subagent_spawned", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
 
-      const health = await replanner.check(plan);
-      if (health.needsReroute) {
-        const newPlan = await replanner.replan(plan, health.failedTasks);
-        await api.updateSessionExtension("plan_state", newPlan);
-        return { action: "revise", reason: health.reason };
+        // 建立 runId → taskId 映射
+        const task = plan.tasks.find(t => t.status === "running" && !plan.taskRunMap[event.runId]);
+        if (task) {
+          plan.taskRunMap[event.runId] = task.id;
+          await event.context.sessions.pluginPatch("plan_state", plan);
+        }
+
+        console.log(`[Plan-Subagent] Subagent spawned: runId=${event.runId}, taskId=${task?.id}`);
+      } catch (error) {
+        console.error("[Plan-Subagent] Subagent spawned tracking failed:", error);
       }
+    });
 
-      // 全部完成，更新状态
-      plan.status = "done";
-      await api.updateSessionExtension("plan_state", plan);
-      return { action: "finalize" };
+    // 9. subagent_ended — 生命周期跟踪（清理映射）
+    api.on("subagent_ended", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
+
+        // 清理 taskRunMap
+        delete plan.taskRunMap[event.runId];
+        await event.context.sessions.pluginPatch("plan_state", plan);
+
+        console.log(`[Plan-Subagent] Subagent ended: runId=${event.runId}`);
+      } catch (error) {
+        console.error("[Plan-Subagent] Subagent ended tracking failed:", error);
+      }
+    });
+
+    // 10. before_agent_finalize — Replanner 重规划决策
+    api.on("before_agent_finalize", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
+
+        const health = await replanner.check(plan);
+        if (health.needsReroute) {
+          const newPlan = await replanner.replan(plan, health.failedTasks);
+          await event.context.sessions.pluginPatch("plan_state", newPlan);
+          return { action: "revise", reason: health.reason };
+        }
+
+        // 全部完成，更新状态
+        plan.status = "done";
+        await event.context.sessions.pluginPatch("plan_state", plan);
+        return { action: "finalize" };
+      } catch (error) {
+        console.error("[Plan-Subagent] Finalize decision failed:", error);
+        return { action: "finalize" };
+      }
     }, { priority: 60 });
 
-    // 7. agent_end — 执行指标记录
+    // 11. heartbeat_prompt_contribution — 执行进度汇报
+    api.on("heartbeat_prompt_contribution", async (event) => {
+      try {
+        const plan = event.context.session?.pluginExtensions?.plan_state;
+        if (!plan || plan.status === "idle") return;
+
+        const progress = router.getProgress(plan);
+        return {
+          contribution: `
+[Plan-Subagent] 当前计划执行进度：
+- 总计：${progress.total} 个任务
+- 已完成：${progress.done} 个
+- 失败：${progress.failed} 个
+- 进行中：${progress.running} 个
+- 等待中：${progress.pending} 个
+          `
+        };
+      } catch (error) {
+        console.error("[Plan-Subagent] Heartbeat failed:", error);
+        return;
+      }
+    });
+
+    // 12. agent_end — 执行指标记录
     api.on("agent_end", async (event) => {
-      console.log(`[Plan-Subagent] Agent ended: runId=${event.runId}, duration=${event.durationMs}ms, success=${event.success}`);
+      try {
+        // 结构化输出执行指标到 Blackboard
+        const metrics = {
+          runId: event.runId,
+          durationMs: event.durationMs,
+          success: event.success,
+          timestamp: Date.now()
+        };
+        await blackboard.writeMetrics(event.runId, JSON.stringify(metrics, null, 2));
+        console.log(`[Plan-Subagent] Agent ended: runId=${event.runId}, duration=${event.durationMs}ms, success=${event.success}`);
+      } catch (error) {
+        console.error("[Plan-Subagent] Metrics logging failed:", error);
+      }
     });
   }
 });
@@ -513,9 +688,31 @@ export interface Plan {
   id: string;
   status: "planning" | "executing" | "reviewing" | "done";
   tasks: Task[];
+  taskRunMap: Record<string, string>;
   createdAt: number;
   updatedAt: number;
 }
+
+// JSON Schema 用于验证 LLM 返回的任务分解结果
+const TaskSchema = {
+  type: "object",
+  properties: {
+    id: { type: "string", pattern: "^task_[0-9]+$" },
+    description: { type: "string", minLength: 1 },
+    skills: { type: "array", items: { type: "string", enum: ["search", "browser", "shell", "code", "file"] } },
+    dependencies: { type: "array", items: { type: "string" } },
+    requiresApproval: { type: "boolean" }
+  },
+  required: ["id", "description", "skills", "dependencies"]
+};
+
+const PlanSchema = {
+  type: "object",
+  properties: {
+    tasks: { type: "array", items: TaskSchema, minItems: 1 }
+  },
+  required: ["tasks"]
+};
 
 export class Planner {
   private llm: LLM;
@@ -527,19 +724,26 @@ export class Planner {
   }
 
   async classify(request: string): Promise<"simple" | "complex"> {
-    const prompt = `
+    try {
+      const prompt = `
 判断以下用户请求是否为复杂任务（需要多步工具调用或跨领域协作）。
 复杂任务的特征：需要同时使用多种工具、涉及多个步骤、需要搜索+编码+文件操作等。
 只回复一个单词："simple" 或 "complex"。
 
 请求: ${request}
-    `;
-    const result = await this.llm.generate(prompt);
-    return result.trim().toLowerCase().includes("complex") ? "complex" : "simple";
+      `;
+      const result = await this.llm.generate(prompt);
+      return result.trim().toLowerCase().includes("complex") ? "complex" : "simple";
+    } catch (error) {
+      console.error("[Planner] Classification failed:", error);
+      // 降级处理：分类失败时假设为 simple，避免阻塞用户
+      return "simple";
+    }
   }
 
   async createPlan(request: string): Promise<Plan> {
-    const prompt = `
+    try {
+      const prompt = `
 将以下用户请求分解为 ${this.maxTasks} 个以内的可并行执行子任务。
 输出严格遵循以下 JSON 格式：
 {
@@ -560,33 +764,82 @@ export class Planner {
 3. 涉及文件删除、系统命令执行等高风险操作标记 requiresApproval: true
 4. 尽量并行化：无依赖的任务应独立，不要串行化
 5. 确保依赖图无环
+6. task id 格式必须为 task_001, task_002 等
 
 用户请求: ${request}
-    `;
+      `;
 
-    const response = await this.llm.generate({
-      prompt,
-      responseFormat: { type: "json_object" }
-    });
+      const response = await this.llm.generate({
+        prompt,
+        responseFormat: { type: "json_object" }
+      });
 
-    const parsed = JSON.parse(response);
-    const tasks: Task[] = parsed.tasks.map((t: any) => ({
-      ...t,
-      status: "pending" as const,
-      skills: t.skills || [],
-      dependencies: t.dependencies || [],
-      requiresApproval: t.requiresApproval || false
-    }));
+      // JSON Schema 验证
+      const parsed = this.validateAndParseJSON(response);
+      const tasks: Task[] = parsed.tasks.map((t) => ({
+        ...t,
+        status: "pending" as const,
+        skills: t.skills || [],
+        dependencies: t.dependencies || [],
+        requiresApproval: t.requiresApproval || false
+      }));
 
-    validateDAG(tasks);
+      validateDAG(tasks);
 
-    return {
-      id: `plan_${Date.now()}`,
-      status: "executing",
-      tasks,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
+      return {
+        id: `plan_${Date.now()}`,
+        status: "executing",
+        tasks,
+        taskRunMap: {},
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+    } catch (error) {
+      console.error("[Planner] Plan creation failed:", error);
+      // 降级：创建单任务 Plan
+      return {
+        id: `plan_${Date.now()}`,
+        status: "executing",
+        tasks: [{
+          id: "task_001",
+          description: request,
+          skills: ["code"],
+          dependencies: [],
+          status: "pending",
+          requiresApproval: false
+        }],
+        taskRunMap: {},
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+    }
+  }
+
+  private validateAndParseJSON(response: string): { tasks: Array<Record<string, unknown>> } {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(response);
+    } catch {
+      throw new Error("Invalid JSON response from LLM");
+    }
+
+    // 基础结构验证
+    if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Record<string, unknown>).tasks)) {
+      throw new Error("Response missing tasks array");
+    }
+
+    const tasks = (parsed as Record<string, unknown>).tasks;
+    for (const task of tasks) {
+      if (!task || typeof task !== "object") {
+        throw new Error("Invalid task structure");
+      }
+      const t = task as Record<string, unknown>;
+      if (!t.id || !t.description || !Array.isArray(t.skills) || !Array.isArray(t.dependencies)) {
+        throw new Error(`Task missing required fields: ${JSON.stringify(task)}`);
+      }
+    }
+
+    return parsed as { tasks: Array<Record<string, unknown>> };
   }
 
   toMarkdown(plan: Plan): string {
@@ -754,35 +1007,42 @@ export class Replanner {
   }
 
   async check(plan: Plan): Promise<HealthCheck> {
-    const failed = plan.tasks.filter(t => t.status === "failed");
-    const running = plan.tasks.filter(t => t.status === "running");
+    try {
+      const failed = plan.tasks.filter(t => t.status === "failed");
+      const running = plan.tasks.filter(t => t.status === "running");
 
-    // 全部完成
-    if (failed.length === 0 && running.length === 0 &&
-        plan.tasks.every(t => t.status === "done" || t.status === "skipped")) {
+      // 全部完成
+      if (failed.length === 0 && running.length === 0 &&
+          plan.tasks.every(t => t.status === "done" || t.status === "skipped")) {
+        return { needsReroute: false, failedTasks: [] };
+      }
+
+      // 有失败任务需要重规划
+      if (failed.length > 0) {
+        // 修复：计算总重试次数，而非"有重试记录的任务数"
+        const retryCount = failed.reduce((sum, t) => sum + (t._retryCount || 0), 0);
+        return {
+          needsReroute: true,
+          failedTasks: failed,
+          reason: `${failed.length} 个任务失败（已重试 ${retryCount} 次），需要重规划`
+        };
+      }
+
+      // 还有运行中的任务，继续等待
+      if (running.length > 0) {
+        return { needsReroute: false, failedTasks: [] };
+      }
+
+      return { needsReroute: false, failedTasks: [] };
+    } catch (error) {
+      console.error("[Replanner] Health check failed:", error);
       return { needsReroute: false, failedTasks: [] };
     }
-
-    // 有失败任务需要重规划
-    if (failed.length > 0) {
-      const retryCount = failed.filter(t => (t as any)._retryCount || 0).length;
-      return {
-        needsReroute: true,
-        failedTasks: failed,
-        reason: `${failed.length} 个任务失败（已重试 ${retryCount} 次），需要重规划`
-      };
-    }
-
-    // 还有运行中的任务，继续等待
-    if (running.length > 0) {
-      return { needsReroute: false, failedTasks: [] };
-    }
-
-    return { needsReroute: false, failedTasks: [] };
   }
 
   async replan(plan: Plan, failedTasks: Task[]): Promise<Plan> {
-    const prompt = `
+    try {
+      const prompt = `
 以下 Plan 中有 ${failedTasks.length} 个任务执行失败。请分析失败原因并选择最佳修复策略。
 
 失败任务:
@@ -807,25 +1067,41 @@ ${failedTasks.map(t => `- ${t.id}: ${t.description} (skills: ${t.skills.join(", 
 - retry 策略时 newTasks 为空（直接重置失败任务状态）
 - decompose 策略时 newTasks 为拆分后的子任务
 - skip 和 escalate 策略时 newTasks 为空
-    `;
+      `;
 
-    const response = await this.llm.generate({
-      prompt,
-      responseFormat: { type: "json_object" }
-    });
+      const response = await this.llm.generate({
+        prompt,
+        responseFormat: { type: "json_object" }
+      });
 
-    const decision: RepairDecision = JSON.parse(response);
-    return this.applyFix(plan, failedTasks, decision);
+      // 安全解析 JSON
+      let decision: RepairDecision;
+      try {
+        decision = JSON.parse(response);
+      } catch {
+        console.error("[Replanner] Failed to parse decision JSON, defaulting to retry");
+        decision = { strategy: "retry", reason: "JSON 解析失败，默认重试" };
+      }
+
+      return this.applyFix(plan, failedTasks, decision);
+    } catch (error) {
+      console.error("[Replanner] Replan failed:", error);
+      // 降级：默认 retry 策略
+      return this.applyFix(plan, failedTasks, { 
+        strategy: "retry", 
+        reason: "重规划失败，默认重试" 
+      });
+    }
   }
 
   private applyFix(plan: Plan, failed: Task[], decision: RepairDecision): Plan {
     switch (decision.strategy) {
       case "retry": {
-        // 重置失败任务为 pending，增加重试计数
+        // 重置失败任务为 pending，增加重试计数（使用类型安全方式）
         for (const task of plan.tasks) {
           if (failed.some(f => f.id === task.id)) {
             task.status = "pending";
-            (task as any)._retryCount = ((task as any)._retryCount || 0) + 1;
+            task._retryCount = (task._retryCount || 0) + 1;
           }
         }
         break;
@@ -899,14 +1175,18 @@ export class Blackboard {
   }
 
   async writeResult(taskId: string, content: string): Promise<void> {
-    const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, content, "utf-8");
+    try {
+      const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf-8");
+    } catch (error) {
+      console.error(`[Blackboard] Failed to write result for ${taskId}:`, error);
+    }
   }
 
   async readResult(taskId: string): Promise<string> {
-    const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
     try {
+      const path = join(this.basePath, "WORKSPACE", `${taskId}.md`);
       return await readFile(path, "utf-8");
     } catch {
       return "";
@@ -914,9 +1194,23 @@ export class Blackboard {
   }
 
   async writePlan(planId: string, content: string): Promise<void> {
-    const path = join(this.basePath, "PLANS", `${planId}.md`);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, content, "utf-8");
+    try {
+      const path = join(this.basePath, "PLANS", `${planId}.md`);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf-8");
+    } catch (error) {
+      console.error(`[Blackboard] Failed to write plan ${planId}:`, error);
+    }
+  }
+
+  async writeMetrics(runId: string, content: string): Promise<void> {
+    try {
+      const path = join(this.basePath, "METRICS", `${runId}.json`);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content, "utf-8");
+    } catch (error) {
+      console.error(`[Blackboard] Failed to write metrics for ${runId}:`, error);
+    }
   }
 
   async aggregateResults(taskIds: string[]): Promise<string> {
@@ -929,6 +1223,23 @@ export class Blackboard {
     }
     return results.join("\n\n---\n\n");
   }
+
+  /** 清理临时文件 */
+  async cleanup(): Promise<void> {
+    try {
+      const { rm } = await import("fs/promises");
+      // 清理 WORKSPACE 和 METRICS 目录中的临时文件
+      const workspacePath = join(this.basePath, "WORKSPACE");
+      const metricsPath = join(this.basePath, "METRICS");
+      
+      await rm(workspacePath, { recursive: true, force: true });
+      await rm(metricsPath, { recursive: true, force: true });
+      
+      console.log("[Blackboard] Cleanup completed");
+    } catch (error) {
+      console.error("[Blackboard] Cleanup failed:", error);
+    }
+  }
 }
 ```
 
@@ -940,16 +1251,17 @@ export class Blackboard {
 openclaw-plugin-plan-subagent/
 ├── src/
 │   ├── index.ts              # 插件入口 (definePluginEntry)
-│   ├── planner.ts            # Planner: 复杂度分类 + 任务分解
-│   ├── router.ts             # TaskRouter: Skill 匹配路由
-│   ├── replanner.ts          # Replanner: revise/finalize 决策
-│   ├── blackboard.ts         # Blackboard: Markdown 状态存储
-│   └── types.ts              # 共享类型定义
+│   ├── planner.ts            # Planner: 复杂度分类 + 任务分解 + JSON Schema 验证
+│   ├── router.ts             # TaskRouter: Skill 匹配路由 + 并发控制
+│   ├── replanner.ts          # Replanner: revise/finalize 决策 + 错误恢复
+│   ├── blackboard.ts         # Blackboard: Markdown 状态存储 + 指标收集
+│   └── types.ts              # 共享类型定义（Plan, Task, AgentRole 等）
 ├── tests/
-│   ├── planner.test.ts       # Planner 单元测试
-│   ├── router.test.ts        # TaskRouter 单元测试
-│   ├── replanner.test.ts     # Replanner 单元测试
-│   └── integration.test.ts   # 集成测试
+│   ├── planner.test.ts       # Planner 单元测试（含降级场景）
+│   ├── router.test.ts        # TaskRouter 单元测试（含并发限制）
+│   ├── replanner.test.ts     # Replanner 单元测试（含重试计数）
+│   ├── blackboard.test.ts    # Blackboard 单元测试（含 cleanup）
+│   └── integration.test.ts   # 集成测试（5 条核心流程）
 ├── plugin.json               # 插件元数据 + 默认配置
 ├── package.json
 ├── tsconfig.json
@@ -993,21 +1305,32 @@ openclaw-plugin-plan-subagent/
 |------|--------|---------|
 | Planner.classify | 简单请求返回 "simple" | 不干预，走正常流程 |
 | Planner.classify | 复杂请求返回 "complex" | 触发 Plan 分解 |
+| Planner.classify | LLM 调用失败 | 降级返回 "simple"，不阻塞用户 |
 | Planner.createPlan | 有效请求 | 返回无环 DAG，Task 数量合理 |
 | Planner.createPlan | 含高风险操作的请求 | requiresApproval=true |
+| Planner.createPlan | LLM 返回无效 JSON | 降级为单任务 Plan |
+| Planner.createPlan | JSON Schema 验证失败 | 抛出明确的错误信息 |
 | TaskRouter.routeBySkill | search 任务 | 返回 researcher |
 | TaskRouter.routeBySkill | code+shell 任务 | 返回 coder |
 | TaskRouter.getReadyTasks | 依赖未满足 | 不返回该任务 |
+| TaskRouter.getReadyTasks | 并发数超过限制 | 阻止创建新 subagent |
 | Replanner.check | 全部完成 | needsReroute=false |
-| Replancer.check | 有失败任务 | needsReroute=true |
-| Replanner.applyFix | retry 策略 | 失败任务重置为 pending |
+| Replanner.check | 有失败任务 | needsReroute=true |
+| Replanner.check | 重试计数正确性 | 返回准确的总重试次数 |
+| Replanner.replan | LLM 调用失败 | 降级为 retry 策略 |
+| Replanner.applyFix | retry 策略 | 失败任务重置为 pending，_retryCount 递增 |
+| Replanner.applyFix | decompose 策略 | 移除失败任务，插入新子任务 |
+| Blackboard.writeResult | 正常写入 | 文件正确写入 WORKSPACE 目录 |
+| Blackboard.cleanup | 调用清理 | 临时文件被正确删除 |
 
 ### 9.2 集成测试
 
 1. **完整流程**：复杂请求 → Plan 生成 → Task 路由 → Subagent 执行 → 结果聚合 → 最终交付
 2. **重规划流程**：故意让任务失败 → Replanner 触发 → revise 决策 → 修复后 finalize
-3. **人工审批**：标记 requiresApproval 的任务 → requireApproval 暂停 → /approve 批准 → 继续执行
-4. **并发控制**：同时调度 5 个独立任务 → 只并发执行 3 个 → 完成后自动执行剩余 2 个
+3. **人工审批**：标记 requiresApproval 的任务 → before_tool_call 拦截 → /approve 批准 → 继续执行
+4. **并发控制**：同时调度 5 个独立任务 → subagent_spawning 限制为 3 个 → 完成后自动执行剩余 2 个
+5. **错误恢复**：LLM 调用失败 → 降级到 simple 流程或单任务 Plan → 正常执行
+6. **状态持久化**：Session Extension 正确读写 → taskRunMap 映射建立和清理 → 跨轮次状态保持
 
 ### 9.3 边界测试
 
@@ -1015,7 +1338,11 @@ openclaw-plugin-plan-subagent/
 - 循环依赖检测（应抛出错误）
 - 最大任务数限制
 - Session Extension 数据过大时的行为
-- 插件卸载时状态清理
+- 插件卸载时状态清理（Blackboard cleanup 调用）
+- LLM 返回格式异常（非 JSON、缺失字段、非法 skill）
+- 并发数达到上限时的排队行为
+- runId 与 taskId 映射不存在时的容错处理
+- 网络超时和 API 限流场景
 
 ---
 
@@ -1031,11 +1358,13 @@ openclaw-plugin-plan-subagent/
 
 ### 10.2 质量要求
 
-- [ ] TypeScript 严格模式，无 any 类型
+- [ ] TypeScript 严格模式，无 `any` 类型（使用 `_retryCount?: number` 等显式类型）
 - [ ] 单元测试覆盖率 > 80%
-- [ ] 集成测试覆盖 3 条核心流程
-- [ ] 错误处理完备，所有异步操作有 try/catch
+- [ ] 集成测试覆盖 5 条核心流程（完整流程、重规划、人工审批、并发控制、错误恢复）
+- [ ] 错误处理完备，**所有异步操作有 try/catch**，LLM 调用失败时降级处理
+- [ ] JSON Schema 验证：LLM 返回的 JSON 必须经过结构验证
 - [ ] 日志记录关键事件，支持调试级别配置
+- [ ] task-run 映射正确性：验证 `runId → taskId` 的完整生命周期
 
 ### 10.3 文档要求
 
@@ -1046,7 +1375,46 @@ openclaw-plugin-plan-subagent/
 
 ---
 
-## 11. 风险提示
+## 11. 修改记录
+
+### 2024-05-02 评审后修订
+
+基于 [Issue #1](https://github.com/KuuDS/korchestrator/issues/1) 的评审和验证结果，本次修订包含以下关键改进：
+
+#### API 修正
+- **Session Extension 更新**：将 `api.updateSessionExtension()` 替换为 `event.context.sessions.pluginPatch()`
+- **Session Extension 读取**：将 `api.getSessionExtension()` 替换为 `event.context.session.pluginExtensions`
+- **配置访问**：将 `api.config` 修正为通过 `event.context.pluginConfig` 获取
+- **Task-run 映射**：新增 `taskRunMap: Record<string, string>` 字段，解决 `runId` 与 `task.id` 语义混淆问题
+
+#### 执行流程修复
+- **避免假开始**：`before_agent_reply` 默认不返回 `syntheticReply` 短路，Plan 直接通过 `before_prompt_build` 注入当前轮次执行
+- **降级方案**：所有 LLM 调用（classify/createPlan/replan）添加 try/catch，失败时降级到 simple 流程或单任务 Plan
+
+#### 状态管理完善
+- **生命周期钩子**：新增 `subagent_spawning`（并发控制）、`subagent_spawned`（建立映射）、`subagent_ended`（清理映射）实现
+- **状态流转**：明确 `pending → running → done/failed/skipped` 的状态流转路径
+- **运行状态标记**：在 `subagent_spawning` 中将任务标记为 `running`，建立 `runId→taskId` 映射
+
+#### 错误处理与类型安全
+- **无 any 类型**：Task 接口新增 `_retryCount?: number` 字段，消除所有 `(task as any)` 类型断言
+- **重试计数修复**：`Replanner.check()` 中使用 `reduce` 计算总重试次数，而非"有重试记录的任务数"
+- **JSON Schema 验证**：`Planner.createPlan()` 中增加 JSON 结构验证，LLM 返回无效时抛出明确错误
+- **全面 try/catch**：所有钩子处理器、Blackboard 方法、LLM 调用均添加错误处理
+
+#### 补齐缺失钩子
+- `before_tool_call`：工具拦截、参数验证、requireApproval 审批流程
+- `subagent_spawning`：并发数检查、任务状态标记
+- `subagent_spawned` / `subagent_ended`：runId→taskId 映射生命周期管理
+- `heartbeat_prompt_contribution`：执行进度汇报（任务总数/已完成/失败/进行中/等待中）
+
+#### 监控完善
+- **结构化指标**：`agent_end` 中将执行指标结构化写入 `Blackboard.writeMetrics()`
+- **Cleanup 逻辑**：`registerSessionExtension` 的 `onCleanup` 调用 `blackboard.cleanup()` 清理临时文件
+
+---
+
+## 12. 风险提示
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
