@@ -1,0 +1,50 @@
+{
+  "id": "plan-subagent",
+  "name": "Plan-Subagent Orchestrator",
+  "version": "1.0.0",
+  "description": "Plan-Task-Build Agent composition mode for complex task orchestration",
+  "main": "dist/index.js",
+  "hooks": {
+    "allowConversationAccess": true
+  },
+  "config": {
+    "plannerModel": "gpt-4o-mini",
+    "replannerModel": "gpt-4o-mini",
+    "maxConcurrency": 3,
+    "maxStepsPerAgent": 20,
+    "skipClassification": false,
+    "classificationRules": [
+      {
+        "pattern": "^(hi|hello|hey|你好|您好|在吗|在？)\\b",
+        "complexity": "simple",
+        "description": "greeting"
+      },
+      {
+        "pattern": "^(what|who|where|when|why|how|什么是|谁是|哪里|什么时候|为什么|怎么)\\b",
+        "complexity": "simple",
+        "description": "simple_question"
+      },
+      {
+        "pattern": "^.{1,20}$",
+        "complexity": "simple",
+        "description": "short_request"
+      },
+      {
+        "pattern": "\\b(create|build|implement|develop|设计|开发|实现|创建|搭建)\\b",
+        "complexity": "complex",
+        "description": "creation_task"
+      },
+      {
+        "pattern": "\\b(and then|之后|然后|接着|再|同时|并且)\\b",
+        "complexity": "complex",
+        "description": "multi_step"
+      }
+    ],
+    "agentRoles": [
+      { "agentId": "researcher", "name": "Researcher", "skills": ["search", "browser"], "model": "gpt-4o-mini" },
+      { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
+      { "agentId": "browser", "name": "BrowserOperator", "skills": ["browser"], "model": "gpt-4o-mini" },
+      { "agentId": "reviewer", "name": "Reviewer", "skills": ["file", "code"], "model": "gpt-4o-mini" }
+    ]
+  }
+}
