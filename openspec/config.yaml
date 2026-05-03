@@ -1,0 +1,24 @@
+schema: spec-driven
+
+context: |
+  Tech stack: TypeScript, Node.js, OpenClaw Plugin SDK
+  Target: OpenClaw plugin implementing Plan-Task-Build multi-agent orchestration
+  Patterns: Hook-based zero-core-invasion, Session Extension persistence, Turn Injection
+  Quality: TypeScript strict mode, no `any` types, >80% test coverage
+
+rules:
+  proposal:
+    - Reference existing PRD requirements by ID (FR-PLAN-*, FR-TASK-*, etc.)
+    - Identify affected hooks and their priority levels
+  specs:
+    - Use Given/When/Then format for scenarios
+    - Map each requirement to specific PRD section
+    - Include both happy path and failure/edge cases
+    - Reference data structures from PRD §5
+  design:
+    - Document hook registration order
+    - Specify error handling and fallback strategies
+    - Note OpenClaw API dependencies and version requirements
+  tasks:
+    - Break down by functional module (Planner, TaskRouter, Replanner, Blackboard)
+    - Include test coverage requirements
