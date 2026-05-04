@@ -2,6 +2,8 @@ import { ConfigManager, type ConfigDiff } from "./config.js";
 import { watchConfig } from "./config-loader.js";
 import { type PluginConfig, DEFAULT_CONFIG } from "./types.js";
 import { Blackboard } from "./blackboard.js";
+import { Planner } from "./planner.js";
+import type { BeforeAgentReplyEvent, BeforePromptBuildEvent } from "./contracts/hooks.js";
 
 /**
  * Hook context provided by the OpenClaw gateway.
@@ -43,6 +45,7 @@ let configManager: ConfigManager | null = null;
 let watcherHandle: { stop: () => void } | null = null;
 let activePlans: string[] = [];
 let blackboard: Blackboard | null = null;
+let planner: Planner | null = null;
 
 /**
  * Get the global ConfigManager instance.
@@ -77,6 +80,20 @@ export function setBlackboard(bb: Blackboard | null): void {
 }
 
 /**
+ * Get the global Planner instance.
+ */
+export function getPlanner(): Planner | null {
+  return planner;
+}
+
+/**
+ * Set the global Planner instance (useful for testing).
+ */
+export function setPlanner(p: Planner | null): void {
+  planner = p;
+}
+
+/**
  * Get the list of active plan IDs (for preserving across reloads).
  */
 export function getActivePlans(): string[] {
@@ -103,7 +120,7 @@ function log(ctx: HookContext, level: "info" | "error" | "warn", message: string
 
 /**
  * Handle gateway_start: load and validate config, start file watcher,
- * and instantiate the Blackboard.
+ * instantiate the Blackboard, and create the Planner.
  */
 async function handleGatewayStart(ctx: HookContext): Promise<void> {
   const cm = getConfigManager();
@@ -127,6 +144,24 @@ async function handleGatewayStart(ctx: HookContext): Promise<void> {
   });
   setBlackboard(bb);
   log(ctx, "info", "Blackboard initialized");
+
+  // Create Planner with config-derived settings
+  const pl = new Planner(
+    {
+      model: config.plannerModel,
+      maxTasks: 20,
+      classificationRules: config.classificationRules,
+      skipClassification: config.skipClassification,
+    },
+    async (prompt: string) => {
+      // Default LLM generate stub — in production this would call the gateway API
+      log(ctx, "warn", `LLM generate called but no real backend wired. Prompt length: ${prompt.length}`);
+      return "complex";
+    }
+  );
+  setPlanner(pl);
+  pl.registerSessionExtension();
+  log(ctx, "info", "Planner initialized");
 
   // Start watching for config changes if not already watching
   if (watcherHandle === null) {
@@ -215,7 +250,11 @@ async function handleConfigChange(ctx: HookContext): Promise<void> {
   }
   if (diff.classificationRulesChanged) {
     log(ctx, "info", "Classification rules changed — clearing rule cache");
-    // Rule cache clear would be invoked here when the cache module exists
+    // Re-create planner with new rules
+    const pl = getPlanner();
+    if (pl !== null) {
+      setPlanner(null);
+    }
   }
   if (diff.skipClassificationChanged) {
     log(ctx, "info", `skipClassification toggled to: ${newConfig.skipClassification}`);
@@ -224,6 +263,79 @@ async function handleConfigChange(ctx: HookContext): Promise<void> {
   // Preserve active plans during reload
   if (activePlans.length > 0) {
     log(ctx, "info", `Preserving ${activePlans.length} active plans during reload`);
+  }
+}
+
+/**
+ * Handle before_agent_reply (priority 80): classify user request complexity.
+ * If the request is simple, no plan is created. If complex, a plan is generated
+ * and stored in session state.
+ */
+export async function handleBeforeAgentReply(ctx: HookContext): Promise<void> {
+  const pl = getPlanner();
+  if (pl === null) {
+    log(ctx, "warn", "Planner not initialized, skipping before_agent_reply");
+    return;
+  }
+
+  const event = ctx as unknown as BeforeAgentReplyEvent;
+  const request = event.userRequest;
+  if (request === undefined || request.length === 0) {
+    return;
+  }
+
+  try {
+    const classification = await pl.classify(request);
+    log(ctx, "info", `Request classified as: ${classification}`);
+
+    if (classification === "complex") {
+      const plan = await pl.createPlan(request);
+      log(ctx, "info", `Created plan ${plan.id} with ${plan.tasks.length} tasks`);
+
+      // Store plan in session state
+      if (event.session !== undefined) {
+        pl.writePlanState(event.session, plan);
+      }
+
+      // Track active plan
+      activePlans.push(plan.id);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(ctx, "error", `Classification/planning failed: ${msg}`);
+  }
+}
+
+/**
+ * Handle before_prompt_build (priority 70): inject plan context into the prompt.
+ * If a plan exists in session state, serializes it to Markdown and prepends.
+ */
+export async function handleBeforePromptBuild(ctx: HookContext): Promise<void> {
+  const pl = getPlanner();
+  if (pl === null) {
+    log(ctx, "warn", "Planner not initialized, skipping before_prompt_build");
+    return;
+  }
+
+  const event = ctx as unknown as BeforePromptBuildEvent;
+  if (event.session === undefined || event.plan === undefined) {
+    return;
+  }
+
+  try {
+    const storedPlan = pl.readPlanState(event.session);
+    if (storedPlan !== null) {
+      const markdown = pl.toMarkdown(storedPlan);
+      log(ctx, "info", `Injecting plan ${storedPlan.id} into prompt`);
+
+      // The hook contract allows returning { prependContext: string }
+      // We attach it to the context for the gateway to pick up
+      const extendedCtx = ctx as unknown as Record<string, unknown>;
+      extendedCtx.prependContext = markdown;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(ctx, "error", `Prompt build injection failed: ${msg}`);
   }
 }
 
@@ -294,6 +406,8 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
       ...(entry.hooks ?? []),
       { event: "gateway_start", handler: handleGatewayStart, priority: 90 },
       { event: "gateway_stop", handler: handleGatewayStop, priority: 90 },
+      { event: "before_agent_reply", handler: handleBeforeAgentReply, priority: 80 },
+      { event: "before_prompt_build", handler: handleBeforePromptBuild, priority: 70 },
       { event: "after_tool_call", handler: handleAfterToolCall, priority: 50 },
       { event: "agent_end", handler: handleAgentEnd, priority: 50 },
     ]
