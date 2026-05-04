@@ -25,6 +25,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate requirement traceability
+        run: npm run validate:traceability -- --format json > traceability-report.json
+
+      - name: Upload traceability report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: traceability-report
+          path: traceability-report.json
+
       - name: Run opencode
         uses: anomalyco/opencode/github@latest
         env:
