@@ -1,24 +1,28 @@
 schema: spec-driven
 
 context: |
-  Tech stack: TypeScript, Node.js, OpenClaw Plugin SDK
-  Target: OpenClaw plugin implementing Plan-Task-Build multi-agent orchestration
-  Patterns: Hook-based zero-core-invasion, Session Extension persistence, Turn Injection
-  Quality: TypeScript strict mode, no `any` types, >80% test coverage
+  语言：中文（简体）
+  所有产出物必须用简体中文撰写。
 
+  技术栈：TypeScript, Node.js, OpenClaw Plugin SDK
+  目标：实现 Plan-Task-Build 多 Agent 编排模式的 OpenClaw 插件
+  模式：基于 Hook 的零侵入式架构、Session Extension 持久化、Turn Injection
+  质量：TypeScript strict 模式，禁止 `any` 类型，测试覆盖率 >80%
+
+# 可选：各产出物规则
 rules:
   proposal:
-    - Reference existing PRD requirements by ID (FR-PLAN-*, FR-TASK-*, etc.)
-    - Identify affected hooks and their priority levels
+    - 引用现有 PRD 需求编号（FR-PLAN-*, FR-TASK-*, 等）
+    - 识别受影响的 Hook 及其优先级
   specs:
-    - Use Given/When/Then format for scenarios
-    - Map each requirement to specific PRD section
-    - Include both happy path and failure/edge cases
-    - Reference data structures from PRD §5
+    - 使用 Given/When/Then 格式编写场景
+    - 将每个需求映射到 PRD 具体章节
+    - 包含正常路径和失败/边界情况
+    - 引用 PRD §5 中的数据结构
   design:
-    - Document hook registration order
-    - Specify error handling and fallback strategies
-    - Note OpenClaw API dependencies and version requirements
+    - 记录 Hook 注册顺序
+    - 说明错误处理和降级策略
+    - 标注 OpenClaw API 依赖及版本要求
   tasks:
-    - Break down by functional module (Planner, TaskRouter, Replanner, Blackboard)
-    - Include test coverage requirements
+    - 按功能模块拆分（Planner, TaskRouter, Replanner, Blackboard）
+    - 包含测试覆盖率要求
