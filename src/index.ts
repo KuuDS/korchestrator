@@ -3,8 +3,9 @@ import { watchConfig } from "./config-loader.js";
 import { type PluginConfig, DEFAULT_CONFIG } from "./types.js";
 import { Blackboard } from "./blackboard.js";
 import { Planner } from "./planner.js";
+import { Replanner } from "./replanner.js";
 import { TaskRouter } from "./router.js";
-import type { BeforeAgentReplyEvent, BeforePromptBuildEvent } from "./contracts/hooks.js";
+import type { BeforeAgentReplyEvent, BeforePromptBuildEvent, BeforeAgentFinalizeEvent } from "./contracts/hooks.js";
 
 /**
  * Hook context provided by the OpenClaw gateway.
@@ -48,6 +49,7 @@ let activePlans: string[] = [];
 let blackboard: Blackboard | null = null;
 let planner: Planner | null = null;
 let taskRouter: TaskRouter | null = null;
+let replanner: Replanner | null = null;
 
 /**
  * Get the global ConfigManager instance.
@@ -107,6 +109,20 @@ export function getTaskRouter(): TaskRouter | null {
  */
 export function setTaskRouter(tr: TaskRouter | null): void {
   taskRouter = tr;
+}
+
+/**
+ * Get the global Replanner instance.
+ */
+export function getReplanner(): Replanner | null {
+  return replanner;
+}
+
+/**
+ * Set the global Replanner instance (useful for testing).
+ */
+export function setReplanner(r: Replanner | null): void {
+  replanner = r;
 }
 
 /**
@@ -186,6 +202,18 @@ async function handleGatewayStart(ctx: HookContext): Promise<void> {
   });
   setTaskRouter(tr);
   log(ctx, "info", `TaskRouter initialized with maxConcurrency=${config.maxConcurrency}`);
+
+  // Instantiate Replanner with config-derived settings
+  const rp = new Replanner({
+    model: config.replannerModel,
+    maxRetries: 3,
+    generate: async (prompt: string) => {
+      log(ctx, "warn", `Replanner LLM generate called but no real backend wired. Prompt length: ${prompt.length}`);
+      return JSON.stringify({ strategy: "retry", reason: "Default fallback" });
+    },
+  });
+  setReplanner(rp);
+  log(ctx, "info", "Replanner initialized");
 
   // Start watching for config changes if not already watching
   if (watcherHandle === null) {
@@ -553,6 +581,57 @@ async function handleAgentEnd(ctx: HookContext): Promise<void> {
 }
 
 /**
+ * Handle before_agent_finalize (priority 60): check plan health and decide
+ * whether to revise or finalize.
+ */
+export async function handleBeforeAgentFinalize(ctx: HookContext): Promise<void> {
+  const rp = getReplanner();
+  const pl = getPlanner();
+
+  if (rp === null || pl === null) {
+    log(ctx, "warn", "Replanner or Planner not initialized, falling back to finalize");
+    return;
+  }
+
+  try {
+    const event = ctx as unknown as BeforeAgentFinalizeEvent;
+    const session = event.session;
+    if (session === undefined) {
+      return;
+    }
+
+    const plan = pl.readPlanState(session);
+    if (plan === null) {
+      return;
+    }
+
+    const health = rp.check(plan);
+
+    if (health.needsReroute) {
+      const decision = await rp.replan(plan, health.failedTasks);
+      rp.applyRepair(plan, health.failedTasks, decision);
+      pl.writePlanState(session, plan);
+      log(ctx, "info", `Plan revised with strategy: ${decision.strategy}`);
+      const extendedCtx = ctx as unknown as Record<string, unknown>;
+      extendedCtx.action = "revise";
+      extendedCtx.reason = decision.reason;
+      return;
+    }
+
+    plan.status = "done";
+    pl.writePlanState(session, plan);
+    log(ctx, "info", "Plan finalized — all tasks completed");
+    const extendedCtx = ctx as unknown as Record<string, unknown>;
+    extendedCtx.action = "finalize";
+    return;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(ctx, "error", `before_agent_finalize error: ${msg}`);
+    return;
+  }
+}
+
+/**
  * Define the plugin entry point.
  */
 export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: PluginEntry["hooks"] }): PluginEntry {
@@ -566,6 +645,7 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
       { event: "before_prompt_build", handler: handleBeforePromptBuild, priority: 70 },
       { event: "subagent_delivery_target", handler: handleSubagentDeliveryTarget, priority: 70 },
       { event: "subagent_spawning", handler: handleSubagentSpawning, priority: 70 },
+      { event: "before_agent_finalize", handler: handleBeforeAgentFinalize, priority: 60 },
       { event: "subagent_spawned", handler: handleSubagentSpawned, priority: 50 },
       { event: "subagent_ended", handler: handleSubagentEnded, priority: 50 },
       { event: "after_tool_call", handler: handleAfterToolCall, priority: 50 },
