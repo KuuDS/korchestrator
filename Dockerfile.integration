@@ -1,0 +1,64 @@
+# Integration test image for openclaw-plugin-plan-subagent
+FROM alpine/openclaw:latest
+
+USER root
+
+# Install plugin into OpenClaw extensions directory
+RUN mkdir -p /app/extensions/plan-subagent
+COPY openclaw-plugin-plan-subagent-0.1.0.tgz /tmp/
+RUN cd /app/extensions/plan-subagent && \
+    tar xzf /tmp/openclaw-plugin-plan-subagent-0.1.0.tgz --strip-components=1 && \
+    rm /tmp/openclaw-plugin-plan-subagent-0.1.0.tgz
+
+# Add openclaw.extensions to package.json so OpenClaw discovers it
+RUN cd /app/extensions/plan-subagent && \
+    node -e 'const fs=require("fs");const pkg=JSON.parse(fs.readFileSync("package.json","utf8"));pkg.openclaw={extensions:["./dist/openclaw-entry.js"]};fs.writeFileSync("package.json",JSON.stringify(pkg,null,2)+"\n")'
+
+# Create OpenClaw plugin manifest
+RUN cd /app/extensions/plan-subagent && \
+    printf '{"id":"openclaw-plugin-plan-subagent","name":"Plan-Task-Build Subagent Orchestrator","version":"0.1.0","configSchema":{}}\n' > openclaw.plugin.json
+
+# Create OpenClaw config with plugin enabled and model configured
+RUN mkdir -p /home/node/.openclaw && \
+    cat > /home/node/.openclaw/openclaw.json <<'EOF'
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback"
+  },
+  "agents": {
+    "defaults": {
+      "model": "moonshot/kimi-k2.5"
+    },
+    "list": [
+      {
+        "id": "pi",
+        "name": "Personal Intelligence",
+        "model": "moonshot/kimi-k2.5"
+      }
+    ]
+  },
+  "plugins": {
+    "enabled": true,
+    "entries": {
+      "openclaw-plugin-plan-subagent": { "enabled": true }
+    }
+  }
+}
+EOF
+
+# Set ownership for node user
+RUN chown -R node:node /home/node/.openclaw /app/extensions/plan-subagent
+
+# Copy integration test script
+COPY integration-test.sh /app/integration-test.sh
+RUN chmod +x /app/integration-test.sh
+
+USER node
+WORKDIR /app
+
+ENV MOONSHOT_API_KEY=""
+ENV OPENCLAW_STATE_DIR="/home/node/.openclaw"
+ENV OPENCLAW_HOME="/home/node"
+
+CMD ["/app/integration-test.sh"]
