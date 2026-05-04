@@ -1,0 +1,19 @@
+{
+  "plannerModel": "gpt-4o-mini",
+  "replannerModel": "gpt-4o-mini",
+  "maxConcurrency": 3,
+  "maxStepsPerAgent": 20,
+  "skipClassification": false,
+  "classificationRules": [
+    { "pattern": "^(hello|hi|hey|你好|您好)", "result": "simple" },
+    { "pattern": "^(what|who|when|where|为什么|什么是)", "result": "simple" },
+    { "pattern": "^(explain|解释|说明).{0,50}$", "result": "simple" }
+  ],
+  "metricsOutput": "blackboard",
+  "agentRoles": [
+    { "agentId": "researcher", "name": "Researcher", "skills": ["search", "browser"], "model": "gpt-4o-mini" },
+    { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
+    { "agentId": "browser", "name": "BrowserOperator", "skills": ["browser"], "model": "gpt-4o-mini" },
+    { "agentId": "reviewer", "name": "Reviewer", "skills": ["file", "code"], "model": "gpt-4o-mini" }
+  ]
+}

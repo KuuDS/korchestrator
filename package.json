@@ -12,9 +12,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "chokidar": "^5.0.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^1.6.1",
     "typescript": "^5.5.0",
     "vitest": "^1.6.0"
   },
