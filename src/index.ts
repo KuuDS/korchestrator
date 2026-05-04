@@ -1,6 +1,7 @@
 import { ConfigManager, type ConfigDiff } from "./config.js";
 import { watchConfig } from "./config-loader.js";
 import { type PluginConfig, DEFAULT_CONFIG } from "./types.js";
+import { Blackboard } from "./blackboard.js";
 
 /**
  * Hook context provided by the OpenClaw gateway.
@@ -41,6 +42,7 @@ export interface PluginEntry {
 let configManager: ConfigManager | null = null;
 let watcherHandle: { stop: () => void } | null = null;
 let activePlans: string[] = [];
+let blackboard: Blackboard | null = null;
 
 /**
  * Get the global ConfigManager instance.
@@ -58,6 +60,20 @@ export function getConfigManager(): ConfigManager {
  */
 export function setConfigManager(cm: ConfigManager | null): void {
   configManager = cm;
+}
+
+/**
+ * Get the global Blackboard instance.
+ */
+export function getBlackboard(): Blackboard | null {
+  return blackboard;
+}
+
+/**
+ * Set the global Blackboard instance (useful for testing).
+ */
+export function setBlackboard(bb: Blackboard | null): void {
+  blackboard = bb;
 }
 
 /**
@@ -86,7 +102,8 @@ function log(ctx: HookContext, level: "info" | "error" | "warn", message: string
 }
 
 /**
- * Handle gateway_start: load and validate config, start file watcher.
+ * Handle gateway_start: load and validate config, start file watcher,
+ * and instantiate the Blackboard.
  */
 async function handleGatewayStart(ctx: HookContext): Promise<void> {
   const cm = getConfigManager();
@@ -100,6 +117,16 @@ async function handleGatewayStart(ctx: HookContext): Promise<void> {
     log(ctx, "error", `Failed to load config: ${msg}. Using default config.`);
     cm.setConfig(DEFAULT_CONFIG);
   }
+
+  const config = cm.getConfig();
+  const bb = new Blackboard({
+    basePath: "./workspace",
+    metricsOutput: config.metricsOutput,
+    metricsWebhook: config.metricsWebhook,
+    metricsOtelEndpoint: config.metricsOtelEndpoint,
+  });
+  setBlackboard(bb);
+  log(ctx, "info", "Blackboard initialized");
 
   // Start watching for config changes if not already watching
   if (watcherHandle === null) {
@@ -201,6 +228,63 @@ async function handleConfigChange(ctx: HookContext): Promise<void> {
 }
 
 /**
+ * Handle after_tool_call: persist tool results to the blackboard.
+ */
+async function handleAfterToolCall(ctx: HookContext): Promise<void> {
+  const bb = getBlackboard();
+  if (bb === null) {
+    log(ctx, "warn", "Blackboard not initialized, skipping after_tool_call");
+    return;
+  }
+
+  // The OpenClaw gateway injects tool call details into the context.
+  // We expect runId and result to be present for persistence.
+  const extendedCtx = ctx as unknown as Record<string, unknown>;
+  const runId = extendedCtx.runId;
+  const result = extendedCtx.result;
+
+  if (typeof runId === "string" && result !== undefined) {
+    try {
+      await bb.writeResult(runId, String(result));
+      log(ctx, "info", `Persisted result for run ${runId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(ctx, "error", `Failed to persist result for run ${runId}: ${msg}`);
+    }
+  }
+}
+
+/**
+ * Handle agent_end: persist execution metrics to the blackboard.
+ */
+async function handleAgentEnd(ctx: HookContext): Promise<void> {
+  const bb = getBlackboard();
+  if (bb === null) {
+    log(ctx, "warn", "Blackboard not initialized, skipping agent_end");
+    return;
+  }
+
+  const extendedCtx2 = ctx as unknown as Record<string, unknown>;
+  const metrics = extendedCtx2.metrics;
+  if (
+    metrics !== undefined &&
+    typeof metrics === "object" &&
+    metrics !== null &&
+    "runId" in metrics &&
+    typeof (metrics as Record<string, unknown>).runId === "string"
+  ) {
+    const runId = (metrics as Record<string, unknown>).runId as string;
+    try {
+      await bb.writeMetrics(runId, metrics as import("./types.js").ExecutionMetrics);
+      log(ctx, "info", `Persisted metrics for run ${runId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(ctx, "error", `Failed to persist metrics for run ${runId}: ${msg}`);
+    }
+  }
+}
+
+/**
  * Define the plugin entry point.
  */
 export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: PluginEntry["hooks"] }): PluginEntry {
@@ -209,7 +293,9 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
     hooks: [
       ...(entry.hooks ?? []),
       { event: "gateway_start", handler: handleGatewayStart, priority: 90 },
-      { event: "gateway_stop", handler: handleGatewayStop, priority: 90 }
+      { event: "gateway_stop", handler: handleGatewayStop, priority: 90 },
+      { event: "after_tool_call", handler: handleAfterToolCall, priority: 50 },
+      { event: "agent_end", handler: handleAgentEnd, priority: 50 },
     ]
   };
 }
