@@ -9,6 +9,8 @@
  * Generation command: scripts/spec-to-types.ts (TODO: implement)
  */
 
+import { z } from "zod";
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Core Domain Types (from openspec/specs/planner/spec.md)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -368,3 +370,142 @@ export const DEFAULT_CONFIG: PluginConfig = {
   metricsOtelEndpoint: "",
   agentRoles: DEFAULT_AGENT_ROLES
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Zod Schema Definitions (from openspec/specs/)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Zod schema for Task validation
+ * @openspec-requirement: FR-PLAN-002, FR-TASK-004
+ */
+export const TaskSchema = z.object({
+  id: z.string().min(1, "Task id must be non-empty"),
+  description: z.string().min(1, "Task description must be non-empty"),
+  skills: z.array(z.enum(["search", "browser", "shell", "code", "file"])),
+  dependencies: z.array(z.string()),
+  status: z.enum(["pending", "running", "done", "failed", "skipped"]),
+  requiresApproval: z.boolean(),
+  assignedAgent: z.string().optional(),
+  result: z.string().optional(),
+  startedAt: z.number().optional(),
+  completedAt: z.number().optional(),
+  _retryCount: z.number().optional()
+});
+
+/**
+ * Zod schema for Plan validation
+ * @openspec-requirement: FR-PLAN-002, FR-PLAN-003
+ */
+export const PlanSchema = z.object({
+  id: z.string().min(1, "Plan id must be non-empty"),
+  status: z.enum(["planning", "executing", "reviewing", "done"]),
+  tasks: z.array(TaskSchema),
+  taskRunMap: z.record(z.string()),
+  createdAt: z.number(),
+  updatedAt: z.number()
+});
+
+/**
+ * Zod schema for AgentRole validation
+ * @openspec-requirement: FR-TASK-002
+ */
+export const AgentRoleSchema = z.object({
+  agentId: z.string().min(1, "Agent id must be non-empty"),
+  name: z.string().min(1, "Agent name must be non-empty"),
+  skills: z.array(z.enum(["search", "browser", "shell", "code", "file"])),
+  model: z.string().min(1, "Model must be non-empty")
+});
+
+/**
+ * Zod schema for RepairDecision validation
+ * @openspec-requirement: FR-BUILD-003
+ */
+export const RepairDecisionSchema = z.object({
+  strategy: z.enum(["retry", "decompose", "skip", "escalate"]),
+  newTasks: z.array(TaskSchema).optional(),
+  reason: z.string().min(1, "Reason must be non-empty")
+});
+
+/**
+ * Zod schema for HealthCheck validation
+ * @openspec-requirement: FR-BUILD-003
+ */
+export const HealthCheckSchema = z.object({
+  needsReroute: z.boolean(),
+  failedTasks: z.array(TaskSchema),
+  reason: z.string().optional()
+});
+
+/**
+ * Zod schema for ClassificationRule validation
+ * @openspec-requirement: FR-PLAN-001, FR-CONFIG-003
+ */
+export const ClassificationRuleSchema = z.object({
+  pattern: z.string(),
+  result: z.enum(["simple", "complex"])
+});
+
+/**
+ * Zod schema for PluginConfig validation with conditional rules
+ * @openspec-requirement: FR-CONFIG-001~004
+ */
+export const PluginConfigSchema = z
+  .object({
+    plannerModel: z.string().min(1, "plannerModel must be non-empty"),
+    replannerModel: z.string().min(1, "replannerModel must be non-empty"),
+    maxConcurrency: z.number().int().min(1, "maxConcurrency must be >= 1"),
+    maxStepsPerAgent: z.number().int().min(1, "maxStepsPerAgent must be >= 1"),
+    skipClassification: z.boolean(),
+    classificationRules: z.array(ClassificationRuleSchema),
+    metricsOutput: z.enum(["blackboard", "webhook", "otel", "none"]),
+    metricsWebhook: z.string().optional(),
+    metricsOtelEndpoint: z.string().optional(),
+    agentRoles: z.array(AgentRoleSchema)
+  })
+  .refine(
+    (data) => {
+      if (data.metricsOutput === "webhook") {
+        return data.metricsWebhook !== undefined && data.metricsWebhook.length > 0;
+      }
+      return true;
+    },
+    {
+      message: "metricsWebhook is required when metricsOutput is 'webhook'",
+      path: ["metricsWebhook"]
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.metricsOutput === "otel") {
+        return data.metricsOtelEndpoint !== undefined && data.metricsOtelEndpoint.length > 0;
+      }
+      return true;
+    },
+    {
+      message: "metricsOtelEndpoint is required when metricsOutput is 'otel'",
+      path: ["metricsOtelEndpoint"]
+    }
+  );
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Inferred Types from Zod Schemas
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Inferred Task type from Zod schema */
+export type TaskZod = z.infer<typeof TaskSchema>;
+
+/** Inferred Plan type from Zod schema */
+export type PlanZod = z.infer<typeof PlanSchema>;
+
+/** Inferred AgentRole type from Zod schema */
+export type AgentRoleZod = z.infer<typeof AgentRoleSchema>;
+
+/** Inferred RepairDecision type from Zod schema */
+export type RepairDecisionZod = z.infer<typeof RepairDecisionSchema>;
+
+/** Inferred HealthCheck type from Zod schema */
+export type HealthCheckZod = z.infer<typeof HealthCheckSchema>;
+
+/** Inferred PluginConfig type from Zod schema */
+export type PluginConfigZod = z.infer<typeof PluginConfigSchema>;
