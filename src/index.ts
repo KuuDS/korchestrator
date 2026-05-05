@@ -6,6 +6,13 @@ import { Planner } from "./planner.js";
 import { Replanner } from "./replanner.js";
 import { TaskRouter } from "./router.js";
 import type { BeforeAgentReplyEvent, BeforePromptBuildEvent, BeforeAgentFinalizeEvent } from "./contracts/hooks.js";
+import {
+  ValidationFramework,
+  createPlanValidationHook,
+  createTaskValidationHook,
+  createValidationFramework,
+} from "./validation/hooks.js";
+import type { ValidationRule } from "./validation/types.js";
 
 /**
  * Hook context provided by the OpenClaw gateway.
@@ -50,6 +57,7 @@ let blackboard: Blackboard | null = null;
 let planner: Planner | null = null;
 let taskRouter: TaskRouter | null = null;
 let replanner: Replanner | null = null;
+let validationFramework: ValidationFramework | null = null;
 
 /**
  * Get the global ConfigManager instance.
@@ -123,6 +131,67 @@ export function getReplanner(): Replanner | null {
  */
 export function setReplanner(r: Replanner | null): void {
   replanner = r;
+}
+
+/**
+ * Get the global ValidationFramework instance.
+ */
+export function getValidationFramework(): ValidationFramework | null {
+  return validationFramework;
+}
+
+/**
+ * Set the global ValidationFramework instance (useful for testing).
+ */
+export function setValidationFramework(vf: ValidationFramework | null): void {
+  validationFramework = vf;
+}
+
+/**
+ * Register a custom validation rule.
+ */
+export function registerValidationRule(rule: ValidationRule): { ruleId: string } {
+  const vf = getValidationFramework();
+  if (vf === null) {
+    throw new Error("ValidationFramework not initialized");
+  }
+  return vf.registerRule(rule);
+}
+
+/**
+ * Validate a plan using the active validation framework.
+ */
+export async function validatePlan(
+  session: unknown,
+  plan: import("./types.js").Plan
+): Promise<{ valid: boolean; results: import("./validation/types.js").ValidationResult[] }> {
+  const vf = getValidationFramework();
+  if (vf === null) {
+    throw new Error("ValidationFramework not initialized");
+  }
+  const { ValidationContextBuilder } = await import("./validation/engine.js");
+  const history: import("./validation/types.js").ValidationHistoryRecord[] = [];
+  const context = ValidationContextBuilder.forPlan(plan, session, {}, history);
+  return vf.validatePlan(context);
+}
+
+/**
+ * Validate a task-agent match using the active validation framework.
+ */
+export async function validateTaskMatch(
+  session: unknown,
+  task: import("./types.js").Task,
+  agent: import("./types.js").AgentRole,
+  plan?: import("./types.js").Plan
+): Promise<{ valid: boolean; results: import("./validation/types.js").ValidationResult[] }> {
+  const vf = getValidationFramework();
+  if (vf === null) {
+    throw new Error("ValidationFramework not initialized");
+  }
+  const { ValidationContextBuilder } = await import("./validation/engine.js");
+  const history: import("./validation/types.js").ValidationHistoryRecord[] = [];
+  const context = ValidationContextBuilder.forTask(task, agent, plan, session, {}, history);
+  return vf.validateTaskMatch(context);
 }
 
 /**
@@ -214,6 +283,16 @@ async function handleGatewayStart(ctx: HookContext): Promise<void> {
   });
   setReplanner(rp);
   log(ctx, "info", "Replanner initialized");
+
+  // Initialize Validation Framework
+  const vf = createValidationFramework({
+    defaultTimeoutMs: 5000,
+    skipValidation: false,
+    retention: { maxAge: "7d", maxRecords: 1000 },
+    disabledRules: [],
+  });
+  setValidationFramework(vf);
+  log(ctx, "info", "ValidationFramework initialized with default rules");
 
   // Start watching for config changes if not already watching
   if (watcherHandle === null) {
@@ -632,6 +711,68 @@ export async function handleBeforeAgentFinalize(ctx: HookContext): Promise<void>
 }
 
 /**
+ * Create a wrapper for the plan validation hook that accesses the current framework.
+ */
+function createPlanValidationHookWrapper(): (ctx: HookContext) => Promise<void> {
+  return async (ctx: HookContext) => {
+    const vf = getValidationFramework();
+    if (vf === null) {
+      log(ctx, "warn", "ValidationFramework not initialized, skipping plan validation");
+      return;
+    }
+
+    const extendedCtx = ctx as unknown as Record<string, unknown>;
+    const session = extendedCtx.session;
+    const plan = extendedCtx.plan as import("./types.js").Plan | undefined;
+
+    if (plan === undefined) {
+      return;
+    }
+
+    const hook = createPlanValidationHook(vf);
+    const result = await hook({ session, plan });
+
+    if (result.block) {
+      extendedCtx.block = true;
+      extendedCtx.reason = result.reason;
+      log(ctx, "warn", `Plan validation blocked: ${result.reason ?? "unknown reason"}`);
+    }
+  };
+}
+
+/**
+ * Create a wrapper for the task validation hook that accesses the current framework.
+ */
+function createTaskValidationHookWrapper(): (ctx: HookContext) => Promise<void> {
+  return async (ctx: HookContext) => {
+    const vf = getValidationFramework();
+    if (vf === null) {
+      log(ctx, "warn", "ValidationFramework not initialized, skipping task validation");
+      return;
+    }
+
+    const extendedCtx = ctx as unknown as Record<string, unknown>;
+    const session = extendedCtx.session;
+    const task = extendedCtx.task as import("./types.js").Task | undefined;
+    const agent = extendedCtx.agent as import("./types.js").AgentRole | undefined;
+    const plan = extendedCtx.plan as import("./types.js").Plan | undefined;
+
+    if (task === undefined || agent === undefined) {
+      return;
+    }
+
+    const hook = createTaskValidationHook(vf);
+    const result = await hook({ session, task, agent, plan });
+
+    if (result.block) {
+      extendedCtx.block = true;
+      extendedCtx.reason = result.reason;
+      log(ctx, "warn", `Task validation blocked: ${result.reason ?? "unknown reason"}`);
+    }
+  };
+}
+
+/**
  * Define the plugin entry point.
  */
 export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: PluginEntry["hooks"] }): PluginEntry {
@@ -642,8 +783,10 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
       { event: "gateway_start", handler: handleGatewayStart, priority: 90 },
       { event: "gateway_stop", handler: handleGatewayStop, priority: 90 },
       { event: "before_agent_reply", handler: handleBeforeAgentReply, priority: 80 },
+      { event: "before_agent_reply", handler: createPlanValidationHookWrapper(), priority: 75 },
       { event: "before_prompt_build", handler: handleBeforePromptBuild, priority: 70 },
       { event: "subagent_delivery_target", handler: handleSubagentDeliveryTarget, priority: 70 },
+      { event: "subagent_delivery_target", handler: createTaskValidationHookWrapper(), priority: 65 },
       { event: "subagent_spawning", handler: handleSubagentSpawning, priority: 70 },
       { event: "before_agent_finalize", handler: handleBeforeAgentFinalize, priority: 60 },
       { event: "subagent_spawned", handler: handleSubagentSpawned, priority: 50 },

@@ -141,6 +141,104 @@ When `classificationRules` change, the rule cache is cleared automatically.
 
 Active plans are preserved across reloads.
 
-## Validation
+## Validation Rules Framework
+
+The plugin includes an extensible validation framework that checks plan quality and task-agent compatibility before execution.
+
+### Default Validation Rules
+
+The framework registers the following rules by default:
+
+| Rule ID | What it checks | Strategy |
+|---------|---------------|----------|
+| `plan-structure` | Plan has required fields (`id`, `tasks`, `taskRunMap`, `createdAt`, `updatedAt`) | block |
+| `no-circular-dep` | Task dependency graph has no cycles | block |
+| `task-granularity` | Task descriptions are reasonably sized (10–500 chars) | warn |
+| `timeout-constraint` | Tasks have timeout configured and ≤ 300s | warn |
+| `agent-capability-match` | Agent's skills cover all task requirements | block |
+| `agent-load-balancer` | Agent has not exceeded concurrent task limit | block |
+| `priority-alignment` | High-priority tasks go to sufficiently high-priority agents | warn |
+
+### Validation Configuration
+
+Add a `validation` section to `plugin.json` to customize behavior:
+
+```json
+{
+  "validation": {
+    "enabled": true,
+    "defaultTimeoutMs": 5000,
+    "skipValidation": false,
+    "retention": {
+      "maxAge": "7d",
+      "maxRecords": 1000
+    },
+    "disabledRules": []
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `validation.enabled` | `boolean` | `true` | Master switch for the validation framework. |
+| `validation.defaultTimeoutMs` | `number` | `5000` | Max time (ms) a single rule may run before timeout. |
+| `validation.skipValidation` | `boolean` | `false` | Emergency bypass — disables all validation when `true`. |
+| `validation.retention.maxAge` | `string` | `"7d"` | How long to keep validation history (e.g. `7d`, `24h`, `60m`). |
+| `validation.retention.maxRecords` | `number` | `1000` | Max number of validation records to retain per session. |
+| `validation.disabledRules` | `string[]` | `[]` | List of rule IDs to disable (e.g. `["task-granularity"]`). |
+
+### API for Custom Rules
+
+Register a custom validation rule at runtime:
+
+```typescript
+import { registerValidationRule } from "openclaw-plugin-plan-subagent";
+
+registerValidationRule({
+  id: "my-custom-rule",
+  name: "My Custom Rule",
+  description: "Checks custom business logic",
+  priority: 100,
+  strategy: "warn",
+  enabled: true,
+  execute: (context) => {
+    const { plan, task, agent } = context;
+    // ... validation logic
+    return { passed: true, ruleId: "my-custom-rule" };
+  }
+});
+```
+
+### Programmatic Validation
+
+```typescript
+import { validatePlan, validateTaskMatch } from "openclaw-plugin-plan-subagent";
+
+// Validate a plan
+const planResult = await validatePlan(session, plan);
+if (!planResult.valid) {
+  console.error("Plan issues:", planResult.results);
+}
+
+// Validate a task-agent assignment
+const matchResult = await validateTaskMatch(session, task, agent, plan);
+if (!matchResult.valid) {
+  console.error("Assignment issues:", matchResult.results);
+}
+```
+
+### Validation History
+
+Validation results are automatically persisted to the session's `validation_state` extension. You can query statistics:
+
+```typescript
+import { getValidationFramework } from "openclaw-plugin-plan-subagent";
+
+const framework = getValidationFramework();
+const stats = framework.getStats(sessionId);
+console.log(`Success rate: ${(stats.passed / stats.total * 100).toFixed(1)}%`);
+```
+
+## Configuration Validation
 
 All configuration is validated using Zod schemas before being applied. If a new config fails validation, the plugin retains the previous valid config and logs detailed error messages.

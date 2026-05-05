@@ -15,5 +15,15 @@
     { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
     { "agentId": "browser", "name": "BrowserOperator", "skills": ["browser"], "model": "gpt-4o-mini" },
     { "agentId": "reviewer", "name": "Reviewer", "skills": ["file", "code"], "model": "gpt-4o-mini" }
-  ]
+  ],
+  "validation": {
+    "enabled": true,
+    "defaultTimeoutMs": 5000,
+    "skipValidation": false,
+    "retention": {
+      "maxAge": "7d",
+      "maxRecords": 1000
+    },
+    "disabledRules": []
+  }
 }
