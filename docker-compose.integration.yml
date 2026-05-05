@@ -1,0 +1,31 @@
+services:
+  openclaw-integration:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration
+      args:
+        # Override with specific version: OPENCLAW_VERSION=2026.5.3
+        OPENCLAW_VERSION: ${OPENCLAW_VERSION:-latest}
+    image: korchestrator/openclaw-integration:${OPENCLAW_VERSION:-latest}
+    container_name: korchestrator-integration
+    environment:
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - OPENCLAW_STATE_DIR=/home/node/.openclaw
+      - OPENCLAW_HOME=/home/node
+    volumes:
+      - ./tests:/app/extensions/plan-subagent/tests:ro
+      - openclaw-data:/app/data
+    healthcheck:
+      test: ["CMD", "openclaw", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  openclaw-data:

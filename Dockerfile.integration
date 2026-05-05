@@ -1,5 +1,8 @@
 # Integration test image for openclaw-plugin-plan-subagent
-FROM alpine/openclaw:latest
+ARG OPENCLAW_VERSION=latest
+
+# Use official OpenClaw image from GitHub Container Registry
+FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
 
 USER root
 

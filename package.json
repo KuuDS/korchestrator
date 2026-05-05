@@ -11,7 +11,9 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "validate:traceability": "tsx scripts/validate-traceability.ts",
-    "validate-types": "tsx scripts/validate-types.ts"
+    "validate-types": "tsx scripts/validate-types.ts",
+    "test:integration": "bash scripts/run-integration-test.sh",
+    "test:integration:version": "bash scripts/run-integration-test.sh"
   },
   "dependencies": {
     "chokidar": "^5.0.0",
