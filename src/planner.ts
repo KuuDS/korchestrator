@@ -172,8 +172,8 @@ export class Planner {
 
       // Convert to full Task objects
       const now = Date.now();
-      const fullTasks: Task[] = tasks.map((t) => ({
-        id: t.id,
+      const fullTasks: Task[] = tasks.map((t, index) => ({
+        id: this.normalizeTaskId(t.id, index),
         description: t.description,
         skills: t.skills as Skill[],
         dependencies: t.dependencies,
@@ -229,6 +229,30 @@ export class Planner {
     }
   }
 
+  /**
+   * Normalize a task ID to the `task_NNN` format.
+   *
+   * @param id - The raw task ID from the LLM
+   * @param index - The zero-based index of the task in the list
+   * @returns The normalized task ID
+   */
+  private normalizeTaskId(id: string, index: number): string {
+    if (/^task_\d{3}$/.test(id)) {
+      return id;
+    }
+    return `task_${String(index + 1).padStart(3, "0")}`;
+  }
+
+  /**
+   * Check if any task in the plan requires user approval.
+   *
+   * @param plan - The plan to check
+   * @returns True if at least one task has requiresApproval set to true
+   */
+  hasTasksRequiringApproval(plan: Plan): boolean {
+    return plan.tasks.some((task) => task.requiresApproval === true);
+  }
+
   // ═════════════════════════════════════════════════════════════════════════════
   // Plan Serialization
   // ═════════════════════════════════════════════════════════════════════════════
@@ -274,11 +298,14 @@ export class Planner {
 
   /**
    * Register a session extension for plan state persistence.
-   * This is a mock implementation for testing.
+   *
+   * Integration point: In production, this calls the OpenClaw gateway API
+   * to register a "plan_state" session extension for persisting plan data
+   * across conversation turns. Example:
+   * gateway.registerSessionExtension("plan_state", { serializer, deserializer });
    */
   registerSessionExtension(): void {
-    // Mock: in production this would call the OpenClaw gateway API
-    // to register a "plan_state" session extension.
+    // Stub: actual registration happens through the OpenClaw gateway API.
   }
 
   /**

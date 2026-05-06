@@ -5,7 +5,7 @@ import { Blackboard } from "./blackboard.js";
 import { Planner } from "./planner.js";
 import { Replanner } from "./replanner.js";
 import { TaskRouter } from "./router.js";
-import type { BeforeAgentReplyEvent, BeforePromptBuildEvent, BeforeAgentFinalizeEvent } from "./contracts/hooks.js";
+import type { BeforeAgentReplyEvent, BeforePromptBuildEvent, BeforeAgentFinalizeEvent, HeartbeatPromptContributionEvent, BeforeToolCallEvent } from "./contracts/hooks.js";
 import {
   ValidationFramework,
   createPlanValidationHook,
@@ -220,23 +220,9 @@ function log(ctx: HookContext, level: "info" | "error" | "warn", message: string
 }
 
 /**
- * Handle gateway_start: load and validate config, start file watcher,
- * instantiate the Blackboard, and create the Planner.
+ * Initialize or reinitialize all plugin components with the given config.
  */
-async function handleGatewayStart(ctx: HookContext): Promise<void> {
-  const cm = getConfigManager();
-  const configPath = ctx.configPath ?? "./plugin.json";
-
-  try {
-    await cm.load(configPath);
-    log(ctx, "info", `Config loaded successfully from ${configPath}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(ctx, "error", `Failed to load config: ${msg}. Using default config.`);
-    cm.setConfig(DEFAULT_CONFIG);
-  }
-
-  const config = cm.getConfig();
+async function initializeComponents(config: PluginConfig, ctx: HookContext): Promise<void> {
   const bb = new Blackboard({
     basePath: "./workspace",
     metricsOutput: config.metricsOutput,
@@ -285,14 +271,36 @@ async function handleGatewayStart(ctx: HookContext): Promise<void> {
   log(ctx, "info", "Replanner initialized");
 
   // Initialize Validation Framework
+  const validationCfg = config.validation;
   const vf = createValidationFramework({
-    defaultTimeoutMs: 5000,
-    skipValidation: false,
-    retention: { maxAge: "7d", maxRecords: 1000 },
-    disabledRules: [],
+    defaultTimeoutMs: validationCfg?.defaultTimeoutMs ?? 5000,
+    skipValidation: validationCfg?.skipValidation ?? false,
+    retention: validationCfg?.retention ?? { maxAge: "7d", maxRecords: 1000 },
+    disabledRules: validationCfg?.disabledRules ?? [],
   });
   setValidationFramework(vf);
   log(ctx, "info", "ValidationFramework initialized with default rules");
+}
+
+/**
+ * Handle gateway_start: load and validate config, start file watcher,
+ * instantiate the Blackboard, and create the Planner.
+ */
+async function handleGatewayStart(ctx: HookContext): Promise<void> {
+  const cm = getConfigManager();
+  const configPath = ctx.configPath ?? "./plugin.json";
+
+  try {
+    await cm.load(configPath);
+    log(ctx, "info", `Config loaded successfully from ${configPath}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log(ctx, "error", `Failed to load config: ${msg}. Using default config.`);
+    cm.setConfig(DEFAULT_CONFIG);
+  }
+
+  const config = cm.getConfig();
+  await initializeComponents(config, ctx);
 
   // Start watching for config changes if not already watching
   if (watcherHandle === null) {
@@ -366,7 +374,10 @@ async function handleConfigChange(ctx: HookContext): Promise<void> {
 
   log(ctx, "info", `Config changed fields: ${diff.changedFields.join(", ")}`);
 
-  // Differentiated reload strategies
+  // Trigger gateway_stop sequence
+  await handleGatewayStop(ctx);
+
+  // Apply differentiated reload strategies
   if (diff.plannerModelChanged) {
     log(ctx, "info", `Planner model updated to: ${newConfig.plannerModel}`);
   }
@@ -381,19 +392,25 @@ async function handleConfigChange(ctx: HookContext): Promise<void> {
   }
   if (diff.classificationRulesChanged) {
     log(ctx, "info", "Classification rules changed — clearing rule cache");
-    // Re-create planner with new rules
-    const pl = getPlanner();
-    if (pl !== null) {
-      setPlanner(null);
-    }
   }
   if (diff.skipClassificationChanged) {
     log(ctx, "info", `skipClassification toggled to: ${newConfig.skipClassification}`);
   }
 
+  // Re-initialize all components with new config
+  await initializeComponents(newConfig, ctx);
+
   // Preserve active plans during reload
   if (activePlans.length > 0) {
     log(ctx, "info", `Preserving ${activePlans.length} active plans during reload`);
+  }
+
+  // Restart watcher
+  if (watcherHandle === null) {
+    watcherHandle = watchConfig(configPath, () => {
+      void handleConfigChange(ctx);
+    });
+    log(ctx, "info", `Restarted config file watcher: ${configPath}`);
   }
 }
 
@@ -471,6 +488,42 @@ export async function handleBeforePromptBuild(ctx: HookContext): Promise<void> {
 }
 
 /**
+ * Handle heartbeat_prompt_contribution (priority 40): return plan progress
+ * contribution when a plan is executing.
+ */
+async function handleHeartbeatPromptContribution(ctx: HookContext): Promise<void> {
+  const pl = getPlanner();
+  if (pl === null) {
+    return;
+  }
+
+  const event = ctx as unknown as HeartbeatPromptContributionEvent;
+  const session = event.session;
+  if (session === undefined) {
+    return;
+  }
+
+  const plan = pl.readPlanState(session);
+  if (plan === null) {
+    const extendedCtx = ctx as unknown as Record<string, unknown>;
+    extendedCtx.contribution = "";
+    return;
+  }
+
+  const tr = getTaskRouter();
+  if (tr === null) {
+    return;
+  }
+
+  const progress = tr.getProgress(plan);
+  const contribution = `Plan execution progress: ${progress.done}/${progress.total} completed, ${progress.failed} failed, ${progress.running} running, ${progress.pending} pending.`;
+
+  const extendedCtx = ctx as unknown as Record<string, unknown>;
+  extendedCtx.contribution = contribution;
+  log(ctx, "info", `Heartbeat contribution for plan ${plan.id}: ${contribution}`);
+}
+
+/**
  * Handle subagent_delivery_target (priority 70): route task to best-matching agent.
  */
 async function handleSubagentDeliveryTarget(ctx: HookContext): Promise<void> {
@@ -528,6 +581,21 @@ async function handleSubagentSpawning(ctx: HookContext): Promise<void> {
     log(ctx, "error", `Concurrency check failed: ${msg}`);
     extendedCtx.block = true;
     extendedCtx.reason = msg;
+  }
+}
+
+/**
+ * Handle before_tool_call (priority 50): log and optionally validate tool calls.
+ */
+async function handleBeforeToolCall(ctx: HookContext): Promise<void> {
+  const event = ctx as unknown as BeforeToolCallEvent;
+  const { toolName, params, runId } = event;
+
+  if (typeof toolName === "string" && typeof runId === "string") {
+    log(ctx, "info", `Before tool call: ${toolName} (runId=${runId})`);
+    if (params !== undefined && typeof params === "object") {
+      log(ctx, "info", `Tool params: ${JSON.stringify(params)}`);
+    }
   }
 }
 
@@ -590,11 +658,19 @@ async function handleSubagentEnded(ctx: HookContext): Promise<void> {
     return;
   }
 
+  let success: boolean | undefined;
+  if (typeof extendedCtx.success === "boolean") {
+    success = extendedCtx.success;
+  } else if (typeof extendedCtx.error === "string" && extendedCtx.error.length > 0) {
+    success = false;
+  }
+
   try {
     await tr.trackLifecycle(
-      { type: "ended", runId, taskId, result: typeof result === "string" ? result : undefined },
+      { type: "ended", runId, taskId, result: typeof result === "string" ? result : undefined, success },
       plan
     );
+    delete plan.taskRunMap[runId];
     log(ctx, "info", `Tracked ended lifecycle for run ${runId}, task ${taskId}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -789,10 +865,12 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
       { event: "subagent_delivery_target", handler: createTaskValidationHookWrapper(), priority: 65 },
       { event: "subagent_spawning", handler: handleSubagentSpawning, priority: 70 },
       { event: "before_agent_finalize", handler: handleBeforeAgentFinalize, priority: 60 },
+      { event: "before_tool_call", handler: handleBeforeToolCall, priority: 50 },
       { event: "subagent_spawned", handler: handleSubagentSpawned, priority: 50 },
       { event: "subagent_ended", handler: handleSubagentEnded, priority: 50 },
       { event: "after_tool_call", handler: handleAfterToolCall, priority: 50 },
       { event: "agent_end", handler: handleAgentEnd, priority: 50 },
+      { event: "heartbeat_prompt_contribution", handler: handleHeartbeatPromptContribution, priority: 40 },
     ]
   };
 }

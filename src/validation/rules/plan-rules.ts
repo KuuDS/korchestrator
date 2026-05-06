@@ -57,7 +57,7 @@ export function planStructureValidator(context: ValidationContext): ValidationRe
     return createPass("plan-structure", "No plan to validate");
   }
 
-  const requiredFields: (keyof Plan)[] = ["id", "tasks", "taskRunMap", "createdAt", "updatedAt"];
+  const requiredFields: (keyof Plan)[] = ["id", "tasks", "taskRunMap", "createdAt", "updatedAt", "metadata"];
   const missingFields: string[] = [];
 
   for (const field of requiredFields) {
@@ -259,6 +259,7 @@ export function timeoutConstraintValidator(context: ValidationContext): Validati
   }
 
   if (issues.length > 0) {
+    const hasMissing = issues.some((i) => i.reason === "missing");
     const messages = issues.map((i) => {
       if (i.reason === "missing") {
         return `${i.taskId}: timeout not configured`;
@@ -266,10 +267,26 @@ export function timeoutConstraintValidator(context: ValidationContext): Validati
       return `${i.taskId}: timeout=${i.timeout} exceeds maximum of 300`;
     });
 
-    return createFail("timeout-constraint", "warning", `Timeout constraint issues: ${messages.join("; ")}`, {
-      code: "TIMEOUT_NOT_CONFIGURED",
-      issues
-    });
+    const result: import("../types.js").ValidationResult = {
+      passed: false,
+      ruleId: "timeout-constraint",
+      severity: "warning",
+      message: `Timeout constraint issues: ${messages.join("; ")}`,
+      metadata: {
+        code: "TIMEOUT_NOT_CONFIGURED",
+        issues
+      }
+    };
+
+    if (hasMissing) {
+      result.fix = {
+        type: "setDefault",
+        description: "Set default timeout to 60s",
+        payload: { timeout: 60 }
+      };
+    }
+
+    return result;
   }
 
   return createPass("timeout-constraint", "All tasks have reasonable timeout configuration");
@@ -333,7 +350,7 @@ export function createTimeoutConstraintValidator(): import("../types.js").Valida
     name: "Timeout Constraint Validator",
     description: "Validates that tasks have reasonable timeout configuration",
     priority: 40,
-    strategy: "warn",
+    strategy: "autoFix",
     enabled: true,
     execute: timeoutConstraintValidator,
   };

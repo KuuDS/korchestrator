@@ -8,14 +8,14 @@
 export interface AgentRole {
   agentId: string;
   name: string;
-  skills: string[];
+  skills: ("search" | "browser" | "shell" | "code" | "file")[];
   model: string;
 }
 
 export interface Task {
   id: string;
   description: string;
-  skills: string[];
+  skills: ("search" | "browser" | "shell" | "code" | "file")[];
   dependencies: string[];
   status: "pending" | "running" | "done" | "failed" | "skipped";
   requiresApproval: boolean;
@@ -33,6 +33,7 @@ export interface Plan {
   taskRunMap: Record<string, string>;
   createdAt: number;
   updatedAt: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface Progress {

@@ -125,18 +125,25 @@ describe("TaskRouter#routeBySkill", () => {
   it("partial match: returns agent with most overlapping skills", () => {
     const router = new TaskRouter({ maxConcurrency: 3, agentPool: pool });
     // coder has [shell, code, file]; reviewer has [file, code]
+    // Both are exact matches; reviewer is more specialized (fewer skills)
     const task = makeTask("t2", { skills: ["code", "file"] });
     const agent = router.routeBySkill(task);
-    // Both coder and reviewer have 2/2; exact match not found, first with max
-    // score is coder (appears before reviewer in pool)
-    expect(agent.agentId).toBe("coder");
+    expect(agent.agentId).toBe("reviewer");
   });
 
-  it("fallback: returns first agent when no skills overlap", () => {
+  it("exact match: prefers most specialized agent (fewest total skills)", () => {
+    const router = new TaskRouter({ maxConcurrency: 3, agentPool: pool });
+    const task = makeTask("t2b", { skills: ["browser"] });
+    const agent = router.routeBySkill(task);
+    // both researcher and browser match; browser is more specialized
+    expect(agent.agentId).toBe("browser");
+  });
+
+  it("fallback: returns coder agent when no skills overlap", () => {
     const router = new TaskRouter({ maxConcurrency: 3, agentPool: pool });
     const task = makeTask("t3", { skills: ["nonexistent"] });
     const agent = router.routeBySkill(task);
-    expect(agent.agentId).toBe("researcher");
+    expect(agent.agentId).toBe("coder");
   });
 
   it("throws when agent pool is empty", () => {
@@ -286,6 +293,100 @@ describe("TaskRouter#trackLifecycle", () => {
     const taskA = plan.tasks.find((t) => t.id === "A")!;
     expect(taskA.status).toBe("pending"); // unchanged
     expect(taskA.result).toBe("partial"); // result still stored
+  });
+
+  it("ended: removes runId from taskRunMap", async () => {
+    plan.taskRunMap["run-2"] = "B";
+    await router.trackLifecycle(
+      { type: "ended", runId: "run-2", taskId: "B", result: "ok" },
+      plan
+    );
+    expect(plan.taskRunMap["run-2"]).toBeUndefined();
+  });
+
+  it("ended: marks task as failed when success is false", async () => {
+    plan.taskRunMap["run-2"] = "B";
+    await router.trackLifecycle(
+      { type: "ended", runId: "run-2", taskId: "B", result: "error", success: false },
+      plan
+    );
+    const taskB = plan.tasks.find((t) => t.id === "B")!;
+    expect(taskB.status).toBe("failed");
+  });
+
+  it("ended: marks task as done when success is true", async () => {
+    plan.taskRunMap["run-2"] = "B";
+    await router.trackLifecycle(
+      { type: "ended", runId: "run-2", taskId: "B", result: "ok", success: true },
+      plan
+    );
+    const taskB = plan.tasks.find((t) => t.id === "B")!;
+    expect(taskB.status).toBe("done");
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Concurrency queue
+// ───────────────────────────────────────────────────────────────────────────────
+
+describe("TaskRouter#checkConcurrency queue", () => {
+  it("queues taskId when blocking and taskId is provided", () => {
+    const tasks: Task[] = [
+      makeTask("A", { status: "running" }),
+      makeTask("B", { status: "running" }),
+      makeTask("C", { status: "running" }),
+    ];
+    const router = new TaskRouter({ maxConcurrency: 3, agentPool: [] });
+    const result = router.checkConcurrency(makePlan(tasks), "D");
+    expect(result.block).toBe(true);
+    expect(result.queued).toBe(true);
+  });
+
+  it("does not duplicate taskId in queue", () => {
+    const tasks: Task[] = [
+      makeTask("A", { status: "running" }),
+      makeTask("B", { status: "running" }),
+      makeTask("C", { status: "running" }),
+    ];
+    const router = new TaskRouter({ maxConcurrency: 3, agentPool: [] });
+    router.checkConcurrency(makePlan(tasks), "D");
+    router.checkConcurrency(makePlan(tasks), "D");
+    // releaseSlot should return D once
+    expect(router.releaseSlot()).toBe("D");
+    expect(router.releaseSlot()).toBeUndefined();
+  });
+
+  it("returns queued taskId in FIFO order", () => {
+    const tasks: Task[] = [
+      makeTask("A", { status: "running" }),
+      makeTask("B", { status: "running" }),
+      makeTask("C", { status: "running" }),
+    ];
+    const router = new TaskRouter({ maxConcurrency: 3, agentPool: [] });
+    router.checkConcurrency(makePlan(tasks), "X");
+    router.checkConcurrency(makePlan(tasks), "Y");
+    router.checkConcurrency(makePlan(tasks), "Z");
+    expect(router.releaseSlot()).toBe("X");
+    expect(router.releaseSlot()).toBe("Y");
+    expect(router.releaseSlot()).toBe("Z");
+    expect(router.releaseSlot()).toBeUndefined();
+  });
+
+  it("releaseSlot is called on ended event", async () => {
+    const plan = makePlan([
+      makeTask("A", { status: "running" }),
+    ]);
+    plan.taskRunMap["run-1"] = "A";
+    const router = new TaskRouter({ maxConcurrency: 1, agentPool: [] });
+    // Queue a task
+    router.checkConcurrency(plan, "B");
+    // End the running task
+    await router.trackLifecycle(
+      { type: "ended", runId: "run-1", taskId: "A" },
+      plan
+    );
+    // releaseSlot should have been called, returning B
+    expect(router.releaseSlot()).toBeUndefined(); // B already dequeued by trackLifecycle
   });
 });
 

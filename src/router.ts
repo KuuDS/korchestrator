@@ -13,6 +13,8 @@ export interface LifecycleEvent {
   taskId: string;
   /** Final result or output from the subagent (only on ended) */
   result?: string;
+  /** Whether the subagent completed successfully (only on ended) */
+  success?: boolean;
 }
 
 /**
@@ -41,6 +43,9 @@ export class TaskRouter {
 
   /** Ordered pool of available agent roles */
   private readonly agentPool: AgentRole[];
+
+  /** FIFO queue of task IDs waiting due to concurrency limits */
+  private readonly pendingQueue: string[] = [];
 
   /**
    * Create a new TaskRouter.
@@ -88,12 +93,18 @@ export class TaskRouter {
 
     const required = new Set(task.skills);
 
-    // Tier 1: Exact match
+    // Tier 1: Exact match — prefer most specialized (fewest total skills)
+    let exactMatch: AgentRole | undefined;
     for (const agent of this.agentPool) {
       const hasAll = Array.from(required).every((skill) => agent.skills.includes(skill));
       if (hasAll) {
-        return agent;
+        if (exactMatch === undefined || agent.skills.length < exactMatch.skills.length) {
+          exactMatch = agent;
+        }
       }
+    }
+    if (exactMatch !== undefined) {
+      return exactMatch;
     }
 
     // Tier 2: Intersection match (most overlapping skills)
@@ -108,26 +119,43 @@ export class TaskRouter {
       }
     }
 
-    // Tier 3: Fallback (bestAgent already set to first agent; if bestScore === 0
-    // and no exact match, we return the first agent in the pool)
-    return bestAgent;
+    // Tier 3: Fallback — prefer default "coder" agent, else first agent in pool
+    const coder = this.agentPool.find((a) => a.agentId === "coder");
+    return coder ?? bestAgent;
   }
 
   /**
    * Check whether spawning another task would exceed the concurrency limit.
    *
    * @param plan - The current execution plan
-   * @returns BlockResult indicating whether to block and why
+   * @param taskId - Optional task ID to queue if blocked
+   * @returns BlockResult indicating whether to block, why, and whether queued
    */
-  checkConcurrency(plan: Plan): { block: boolean; reason?: string } {
+  checkConcurrency(
+    plan: Plan,
+    taskId?: string
+  ): { block: boolean; reason?: string; queued?: boolean } {
     const runningCount = plan.tasks.filter((t) => t.status === "running").length;
     if (runningCount >= this.maxConcurrency) {
+      if (taskId !== undefined && !this.pendingQueue.includes(taskId)) {
+        this.pendingQueue.push(taskId);
+      }
       return {
         block: true,
         reason: `Concurrency limit reached (${runningCount}/${this.maxConcurrency})`,
+        queued: taskId !== undefined,
       };
     }
     return { block: false };
+  }
+
+  /**
+   * Release a concurrency slot and return the next queued task ID (if any).
+   *
+   * @returns The next task ID from the FIFO queue, or undefined if empty
+   */
+  releaseSlot(): string | undefined {
+    return this.pendingQueue.shift();
   }
 
   /**
@@ -200,11 +228,11 @@ export class TaskRouter {
           }
         }
       } else if (event.type === "ended") {
-        // Update task status to done
+        // Update task status based on success
         const task = plan.tasks.find((t) => t.id === event.taskId);
         if (task !== undefined) {
           if (task.status === "running") {
-            task.status = "done";
+            task.status = event.success === false ? "failed" : "done";
             task.completedAt = Date.now();
             if (event.result !== undefined) {
               task.result = event.result;
@@ -217,6 +245,12 @@ export class TaskRouter {
             }
           }
         }
+
+        // Remove runId → taskId mapping
+        delete plan.taskRunMap[event.runId];
+
+        // Release concurrency slot and trigger next queued task
+        this.releaseSlot();
       }
 
       plan.updatedAt = Date.now();

@@ -13,7 +13,10 @@
     "validate:traceability": "tsx scripts/validate-traceability.ts",
     "validate-types": "tsx scripts/validate-types.ts",
     "test:integration": "bash scripts/run-integration-test.sh",
-    "test:integration:version": "bash scripts/run-integration-test.sh"
+    "test:integration:version": "bash scripts/run-integration-test.sh",
+    "eval": "tsx scripts/run-evaluation.ts",
+    "eval:live": "tsx scripts/run-evaluation.ts --live",
+    "eval:report": "tsx scripts/run-evaluation.ts --output eval-reports"
   },
   "dependencies": {
     "chokidar": "^5.0.0",

@@ -11,6 +11,7 @@ import {
   setBlackboard,
   getPlanner,
   setPlanner,
+  getTaskRouter,
   setTaskRouter,
   setReplanner,
   getActivePlans,
@@ -137,10 +138,10 @@ export default function register(api: any): void {
     }
   }, { priority: 90 });
 
-  api.on("before_agent_start", async (event: any, _ctx: any) => {
+  api.on("before_agent_reply", async (event: any, _ctx: any) => {
     const pl = getPlanner();
     if (pl === null) {
-      api.logger.warn("Planner not initialized, skipping before_agent_start");
+      api.logger.warn("Planner not initialized, skipping before_agent_reply");
       return;
     }
     const request = event.prompt;
@@ -153,6 +154,14 @@ export default function register(api: any): void {
       if (classification === "complex") {
         const plan = await pl.createPlan(request);
         api.logger.info(`Created plan ${plan.id} with ${plan.tasks.length} tasks`);
+
+        // Store plan in session state if available
+        const session = event.session ?? event.context?.session;
+        if (session !== undefined) {
+          pl.writePlanState(session, plan);
+        }
+
+        // Track active plan
         const plans = getActivePlans();
         plans.push(plan.id);
       }
@@ -162,51 +171,216 @@ export default function register(api: any): void {
     }
   }, { priority: 80 });
 
-  api.on("before_prompt_build", async (_event: any, _ctx: any) => {
+  api.on("before_prompt_build", async (event: any, _ctx: any) => {
     const pl = getPlanner();
     if (pl === null) {
       api.logger.warn("Planner not initialized, skipping before_prompt_build");
       return;
     }
-    // Note: OpenClaw passes prompt/messages but not a session object directly.
-    // We skip injection here because the session abstraction differs.
-    api.logger.info("Before prompt build hook fired");
+
+    const session = event.session ?? event.context?.session;
+    if (session === undefined) {
+      return;
+    }
+
+    try {
+      const storedPlan = pl.readPlanState(session);
+      if (storedPlan !== null) {
+        const markdown = pl.toMarkdown(storedPlan);
+        api.logger.info(`Injecting plan ${storedPlan.id} into prompt`);
+        event.prependContext = markdown;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger.error(`Prompt build injection failed: ${msg}`);
+    }
   }, { priority: 70 });
 
-  api.on("subagent_delivery_target", async (_event: any, _ctx: any) => {
-    api.logger.info("Subagent delivery target hook fired");
+  api.on("subagent_delivery_target", async (event: any, _ctx: any) => {
+    const tr = getTaskRouter();
+    if (tr === null) {
+      api.logger.warn("TaskRouter not initialized, skipping subagent_delivery_target");
+      return;
+    }
+
+    const task = event.task;
+    if (task === undefined) {
+      api.logger.warn("No task provided for subagent_delivery_target");
+      return;
+    }
+
+    try {
+      const agent = tr.routeBySkill(task);
+      api.logger.info(`Routed task ${task.id} to agent ${agent.agentId}`);
+      event.targetAgentId = agent.agentId;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger.error(`Task routing failed: ${msg}`);
+    }
   }, { priority: 70 });
 
-  api.on("subagent_spawning", async (_event: any, _ctx: any) => {
-    api.logger.info("Subagent spawning hook fired");
+  api.on("subagent_spawning", async (event: any, _ctx: any) => {
+    const tr = getTaskRouter();
+    if (tr === null) {
+      api.logger.warn("TaskRouter not initialized, skipping subagent_spawning");
+      return;
+    }
+
+    const plan = event.plan ?? event.context?.session?.pluginExtensions?.plan_state;
+    if (plan === undefined) {
+      api.logger.warn("No plan provided for subagent_spawning");
+      return;
+    }
+
+    try {
+      const result = tr.checkConcurrency(plan);
+      if (result.block) {
+        api.logger.info(`Blocked spawn: ${result.reason ?? "unknown reason"}`);
+        event.block = true;
+        event.reason = result.reason;
+      } else {
+        event.block = false;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger.error(`Concurrency check failed: ${msg}`);
+      event.block = true;
+      event.reason = msg;
+    }
   }, { priority: 70 });
 
-  api.on("subagent_spawned", async (_event: any, _ctx: any) => {
-    api.logger.info("Subagent spawned hook fired");
+  api.on("subagent_spawned", async (event: any, _ctx: any) => {
+    const tr = getTaskRouter();
+    if (tr === null) {
+      api.logger.warn("TaskRouter not initialized, skipping subagent_spawned");
+      return;
+    }
+
+    const runId = event.runId;
+    let taskId = event.taskId;
+    const plan = event.plan ?? event.context?.session?.pluginExtensions?.plan_state;
+
+    if (typeof runId !== "string" || plan === undefined) {
+      api.logger.warn("Missing runId or plan for subagent_spawned");
+      return;
+    }
+
+    // Fallback: infer taskId from plan if not provided directly
+    if (typeof taskId !== "string") {
+      const runningTask = plan.tasks.find(
+        (t: import("./types.js").Task) => t.status === "running" && !plan.taskRunMap[runId]
+      );
+      if (runningTask !== undefined) {
+        taskId = runningTask.id;
+      }
+    }
+
+    if (typeof taskId !== "string") {
+      api.logger.warn(`No taskId mapped or inferred for run ${runId} in subagent_spawned`);
+      return;
+    }
+
+    try {
+      await tr.trackLifecycle({ type: "spawned", runId, taskId }, plan);
+      api.logger.info(`Tracked spawned lifecycle for run ${runId}, task ${taskId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger.error(`Lifecycle tracking (spawned) failed: ${msg}`);
+    }
   }, { priority: 50 });
 
-  api.on("subagent_ended", async (_event: any, _ctx: any) => {
-    api.logger.info("Subagent ended hook fired");
+  api.on("subagent_ended", async (event: any, _ctx: any) => {
+    const tr = getTaskRouter();
+    if (tr === null) {
+      api.logger.warn("TaskRouter not initialized, skipping subagent_ended");
+      return;
+    }
+
+    const runId = event.runId;
+    const result = event.result;
+    const plan = event.plan ?? event.context?.session?.pluginExtensions?.plan_state;
+
+    if (typeof runId !== "string" || plan === undefined) {
+      api.logger.warn("Missing runId or plan for subagent_ended");
+      return;
+    }
+
+    const taskId = plan.taskRunMap[runId];
+    if (taskId === undefined) {
+      api.logger.warn(`No taskId mapped for run ${runId} in subagent_ended`);
+      return;
+    }
+
+    try {
+      await tr.trackLifecycle(
+        { type: "ended", runId, taskId, result: typeof result === "string" ? result : undefined },
+        plan
+      );
+      api.logger.info(`Tracked ended lifecycle for run ${runId}, task ${taskId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      api.logger.error(`Lifecycle tracking (ended) failed: ${msg}`);
+    }
   }, { priority: 50 });
 
-  api.on("after_tool_call", async (_event: any, _ctx: any) => {
+  api.on("after_tool_call", async (event: any, _ctx: any) => {
     const bb = getBlackboard();
     if (bb === null) {
       api.logger.warn("Blackboard not initialized, skipping after_tool_call");
       return;
     }
-    // Note: OpenClaw passes toolName/result but not runId directly.
-    api.logger.info("After tool call hook fired");
+
+    const runId = event.runId;
+    const result = event.result;
+
+    if (typeof runId === "string" && result !== undefined) {
+      try {
+        await bb.writeResult(runId, String(result));
+        api.logger.info(`Persisted result for run ${runId}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`Failed to persist result for run ${runId}: ${msg}`);
+      }
+    }
   }, { priority: 50 });
 
-  api.on("agent_end", async (_event: any, _ctx: any) => {
+  api.on("agent_end", async (event: any, _ctx: any) => {
     const bb = getBlackboard();
     if (bb === null) {
       api.logger.warn("Blackboard not initialized, skipping agent_end");
       return;
     }
-    // Note: OpenClaw passes messages/success/durationMs but not metrics object.
-    api.logger.info("Agent end hook fired");
+
+    let metrics: unknown = event.metrics;
+    if (
+      metrics === undefined &&
+      typeof event.runId === "string" &&
+      event.durationMs !== undefined
+    ) {
+      metrics = {
+        runId: event.runId,
+        durationMs: event.durationMs,
+        success: event.success,
+        timestamp: Date.now(),
+      };
+    }
+
+    if (
+      metrics !== undefined &&
+      typeof metrics === "object" &&
+      metrics !== null &&
+      "runId" in metrics &&
+      typeof (metrics as Record<string, unknown>).runId === "string"
+    ) {
+      const runId = (metrics as Record<string, unknown>).runId as string;
+      try {
+        await bb.writeMetrics(runId, metrics as import("./types.js").ExecutionMetrics);
+        api.logger.info(`Persisted metrics for run ${runId}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        api.logger.error(`Failed to persist metrics for run ${runId}: ${msg}`);
+      }
+    }
   }, { priority: 50 });
 
   api.logger.info("Plan-subagent plugin registered successfully");

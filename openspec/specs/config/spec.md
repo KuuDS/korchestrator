@@ -132,7 +132,14 @@ The system SHALL validate all configuration changes before applying them.
     { "agentId": "coder", "name": "Coder", "skills": ["shell", "code", "file"], "model": "gpt-4o" },
     { "agentId": "browser", "name": "BrowserOperator", "skills": ["browser"], "model": "gpt-4o-mini" },
     { "agentId": "reviewer", "name": "Reviewer", "skills": ["file", "code"], "model": "gpt-4o-mini" }
-  ]
+  ],
+  "validation": {
+    "enabled": true,
+    "defaultTimeoutMs": 5000,
+    "skipValidation": false,
+    "retention": { "maxAge": "7d", "maxRecords": 1000 },
+    "disabledRules": []
+  }
 }
 ```
 
@@ -150,3 +157,9 @@ The system SHALL validate all configuration changes before applying them.
 | `metricsWebhook` | Valid URL when `metricsOutput` is `"webhook"` |
 | `metricsOtelEndpoint` | Valid URL when `metricsOutput` is `"otel"` |
 | `agentRoles` | Array of valid AgentRole objects |
+| `validation.enabled` | Boolean |
+| `validation.defaultTimeoutMs` | Integer ≥ 1 |
+| `validation.skipValidation` | Boolean |
+| `validation.retention.maxAge` | Optional string (e.g., `"7d"`, `"24h"`) |
+| `validation.retention.maxRecords` | Optional integer ≥ 1 |
+| `validation.disabledRules` | Array of rule ID strings |

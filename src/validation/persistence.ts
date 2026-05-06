@@ -97,6 +97,74 @@ export class ValidationHistoryRecorder {
       (r) => r.type === "task" && r.taskId === taskId
     );
   }
+
+  /**
+   * Clean up old validation records based on retention config.
+   *
+   * @param sessionId - Session identifier
+   * @param config - Retention configuration
+   * @returns Number of records removed
+   */
+  cleanup(sessionId: string, config: RetentionConfig): number {
+    const records = this.sessionStore.get(sessionId) ?? [];
+    const originalCount = records.length;
+
+    let filtered = records;
+
+    // Filter by maxAge
+    if (config.maxAge !== undefined) {
+      const match = config.maxAge.match(/^(\d+)([dhms])$/);
+      if (match !== null) {
+        const value = parseInt(match[1], 10);
+        const unit = match[2];
+        let maxAgeMs: number;
+        switch (unit) {
+          case "d":
+            maxAgeMs = value * 24 * 60 * 60 * 1000;
+            break;
+          case "h":
+            maxAgeMs = value * 60 * 60 * 1000;
+            break;
+          case "m":
+            maxAgeMs = value * 60 * 1000;
+            break;
+          case "s":
+            maxAgeMs = value * 1000;
+            break;
+          default:
+            maxAgeMs = 0;
+        }
+        const cutoff = Date.now() - maxAgeMs;
+        filtered = filtered.filter((r) => r.timestamp >= cutoff);
+      }
+    }
+
+    // Filter by maxRecords (keep most recent)
+    if (config.maxRecords !== undefined && filtered.length > config.maxRecords) {
+      filtered = filtered
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, config.maxRecords)
+        .sort((a, b) => a.timestamp - b.timestamp);
+    }
+
+    const removed = originalCount - filtered.length;
+    if (removed > 0) {
+      this.sessionStore.set(sessionId, filtered);
+    }
+    return removed;
+  }
+
+  /**
+   * Load existing validation history for a session.
+   *
+   * @param sessionId - Session identifier
+   * @param records - Existing validation records
+   */
+  loadHistory(sessionId: string, records: ValidationHistoryRecord[]): void {
+    if (!this.sessionStore.has(sessionId)) {
+      this.sessionStore.set(sessionId, records);
+    }
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -141,17 +209,45 @@ export class ValidationStatsCollector {
   }
 
   /**
+   * Parse a time range string to milliseconds.
+   * Supports: "7d", "24h", "60m", "30s"
+   */
+  private parseTimeRange(timeRange: string): number {
+    const match = timeRange.match(/^(\d+)([dhms])$/);
+    if (match === null) {
+      throw new Error(`Invalid time range format: ${timeRange}`);
+    }
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2];
+
+    switch (unit) {
+      case "d":
+        return value * 24 * 60 * 60 * 1000;
+      case "h":
+        return value * 60 * 60 * 1000;
+      case "m":
+        return value * 60 * 1000;
+      case "s":
+        return value * 1000;
+      default:
+        throw new Error(`Unknown time range unit: ${unit}`);
+    }
+  }
+
+  /**
    * Get statistics for a specific rule.
    *
    * @param sessionId - Session identifier
    * @param ruleId - Rule identifier
-   * @param timeRangeMs - Time range in milliseconds (e.g., 24 * 60 * 60 * 1000)
+   * @param timeRange - Time range string (e.g., "24h", "7d", "1h")
    */
   getRuleStats(
     sessionId: string,
     ruleId: string,
-    timeRangeMs?: number
+    timeRange?: string
   ): { total: number; passed: number; failed: number; avgDurationMs: number } {
+    const timeRangeMs = timeRange !== undefined ? this.parseTimeRange(timeRange) : undefined;
     const cutoff = timeRangeMs !== undefined ? Date.now() - timeRangeMs : 0;
     const records = this.recorder
       .getHistory(sessionId)
@@ -187,7 +283,7 @@ export class ValidationStatsCollector {
    * Get overall statistics for plan validations.
    *
    * @param sessionId - Session identifier
-   * @param timeRangeMs - Optional time range filter
+   * @param timeRangeMs - Optional time range filter in milliseconds
    */
   getPlanStats(
     sessionId: string,
@@ -208,6 +304,64 @@ export class ValidationStatsCollector {
       passed,
       failed: total - passed,
       successRate: total > 0 ? passed / total : 0,
+    };
+  }
+
+  /**
+   * Get validation statistics based on a flexible query.
+   *
+   * - `{ ruleId, timeRange }` → per-rule stats with optional time filter
+   * - `{ type, granularity }` → aggregated success rate by time bucket
+   */
+  getValidationStats(
+    sessionId: string,
+    query:
+      | { ruleId: string; timeRange?: string }
+      | { type: string; granularity?: string }
+  ): Record<string, unknown> {
+    if ("ruleId" in query) {
+      return this.getRuleStats(sessionId, query.ruleId, query.timeRange);
+    }
+
+    const granularity = query.granularity ?? "hour";
+    const records = this.recorder
+      .getHistory(sessionId)
+      .filter((r) => r.type === query.type);
+
+    const buckets = new Map<string, { total: number; passed: number }>();
+
+    for (const record of records) {
+      const date = new Date(record.timestamp);
+      let key: string;
+      if (granularity === "day") {
+        key = date.toISOString().slice(0, 10); // YYYY-MM-DD
+      } else {
+        key = `${date.toISOString().slice(0, 13)}:00`; // YYYY-MM-DDTHH:00
+      }
+
+      const bucket = buckets.get(key) ?? { total: 0, passed: 0 };
+      bucket.total++;
+      const allPassed = record.results.every((res) => res.passed);
+      if (allPassed) {
+        bucket.passed++;
+      }
+      buckets.set(key, bucket);
+    }
+
+    const sortedKeys = Array.from(buckets.keys()).sort();
+    const data = sortedKeys.map((key) => {
+      const bucket = buckets.get(key)!;
+      return {
+        time: key,
+        total: bucket.total,
+        successRate: bucket.total > 0 ? bucket.passed / bucket.total : 0,
+      };
+    });
+
+    return {
+      granularity,
+      type: query.type,
+      data,
     };
   }
 

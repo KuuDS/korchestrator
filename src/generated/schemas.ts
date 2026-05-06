@@ -10,14 +10,14 @@ import { z } from "zod";
 export const AgentRoleSchema = z.object({
   agentId: z.string(),
   name: z.string(),
-  skills: z.array(z.string()),
+  skills: z.array(z.enum(["search", "browser", "shell", "code", "file"])),
   model: z.string(),
 });
 
 export const TaskSchema = z.object({
   id: z.string(),
   description: z.string(),
-  skills: z.array(z.string()),
+  skills: z.array(z.enum(["search", "browser", "shell", "code", "file"])),
   dependencies: z.array(z.string()),
   status: z.enum(["pending", "running", "done", "failed", "skipped"]),
   requiresApproval: z.boolean(),
@@ -35,6 +35,7 @@ export const PlanSchema = z.object({
   taskRunMap: z.record(z.string()),
   createdAt: z.number(),
   updatedAt: z.number(),
+  metadata: z.record(z.unknown()).optional(),
 });
 
 export const ProgressSchema = z.object({

@@ -243,6 +243,112 @@ describe("ValidationHistoryRecorder", () => {
       expect(recorder.getTaskHistory(sessionId, "task-1")).toHaveLength(1);
     });
   });
+
+  describe("cleanup", () => {
+    it("should remove records older than maxAge", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMockReport({ timestamp: now - 86400000 * 2 }) // 2 days old
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMockReport({ timestamp: now - 3600000 }) // 1 hour old
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-3",
+        createMockReport({ timestamp: now }) // now
+      );
+
+      const removed = recorder.cleanup(sessionId, { maxAge: "1d" });
+      expect(removed).toBe(1);
+      expect(recorder.getHistory(sessionId)).toHaveLength(2);
+    });
+
+    it("should keep only the most recent N records with maxRecords", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMockReport({ timestamp: now - 2000 })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMockReport({ timestamp: now - 1000 })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-3",
+        createMockReport({ timestamp: now })
+      );
+
+      const removed = recorder.cleanup(sessionId, { maxRecords: 2 });
+      expect(removed).toBe(1);
+      expect(recorder.getHistory(sessionId)).toHaveLength(2);
+    });
+
+    it("should apply both maxAge and maxRecords filters", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMockReport({ timestamp: now - 86400000 * 10 })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMockReport({ timestamp: now - 3600000 })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-3",
+        createMockReport({ timestamp: now - 1800000 })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-4",
+        createMockReport({ timestamp: now })
+      );
+
+      const removed = recorder.cleanup(sessionId, { maxAge: "7d", maxRecords: 2 });
+      expect(removed).toBe(2);
+      expect(recorder.getHistory(sessionId)).toHaveLength(2);
+    });
+
+    it("should return 0 for empty history", () => {
+      expect(recorder.cleanup("empty-session", { maxAge: "7d" })).toBe(0);
+    });
+  });
+
+  describe("loadHistory", () => {
+    it("should load existing records for a session", () => {
+      const sessionId = "session-1";
+      const records = [createMockRecord(), createMockRecord()];
+
+      recorder.loadHistory(sessionId, records);
+      expect(recorder.getHistory(sessionId)).toHaveLength(2);
+    });
+
+    it("should not overwrite existing records", () => {
+      const sessionId = "session-1";
+      recorder.recordPlanValidation(sessionId, "plan-1", createMockReport());
+
+      const newRecords = [createMockRecord(), createMockRecord()];
+      recorder.loadHistory(sessionId, newRecords);
+
+      expect(recorder.getHistory(sessionId)).toHaveLength(1);
+    });
+  });
 });
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -305,7 +411,7 @@ describe("ValidationStatsCollector", () => {
         createMixedResultsReport(now, { ruleId: "rule-a", passed: true })
       );
 
-      const stats = statsCollector.getRuleStats(sessionId, "rule-a", 5000);
+      const stats = statsCollector.getRuleStats(sessionId, "rule-a", "5s");
       expect(stats.total).toBe(2);
     });
 
@@ -495,6 +601,110 @@ describe("ValidationStatsCollector", () => {
 
       const stats = statsCollector.getAllStats(sessionId);
       expect(stats.total).toBe(2);
+    });
+  });
+
+  describe("getValidationStats", () => {
+    it("should return rule stats when ruleId is provided", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMixedResultsReport(now, { ruleId: "rule-a", passed: true })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMixedResultsReport(now, { ruleId: "rule-a", passed: false })
+      );
+
+      const stats = statsCollector.getValidationStats(sessionId, { ruleId: "rule-a" });
+      expect(stats).toMatchObject({
+        total: 2,
+        passed: 1,
+        failed: 1,
+      });
+    });
+
+    it("should filter rule stats by timeRange", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMixedResultsReport(now - 10000, { ruleId: "rule-a", passed: true })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMixedResultsReport(now, { ruleId: "rule-a", passed: false })
+      );
+
+      const stats = statsCollector.getValidationStats(sessionId, { ruleId: "rule-a", timeRange: "5s" });
+      expect(stats).toMatchObject({
+        total: 1,
+        passed: 0,
+        failed: 1,
+      });
+    });
+
+    it("should return hourly aggregated data when type is provided", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMixedResultsReport(now, { ruleId: "rule-1", passed: true })
+      );
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-2",
+        createMixedResultsReport(now, { ruleId: "rule-1", passed: false })
+      );
+
+      const stats = statsCollector.getValidationStats(sessionId, { type: "plan", granularity: "hour" });
+      expect(stats).toMatchObject({
+        type: "plan",
+        granularity: "hour",
+      });
+      expect(Array.isArray(stats.data)).toBe(true);
+      expect(stats.data).toHaveLength(1);
+      expect(stats.data[0]).toMatchObject({
+        total: 2,
+        successRate: 0.5,
+      });
+    });
+
+    it("should return daily aggregated data with day granularity", () => {
+      const sessionId = "session-1";
+      const now = Date.now();
+
+      recorder.recordPlanValidation(
+        sessionId,
+        "plan-1",
+        createMixedResultsReport(now, { ruleId: "rule-1", passed: true })
+      );
+
+      const stats = statsCollector.getValidationStats(sessionId, { type: "plan", granularity: "day" });
+      expect(stats).toMatchObject({
+        type: "plan",
+        granularity: "day",
+      });
+      expect(Array.isArray(stats.data)).toBe(true);
+      expect(stats.data).toHaveLength(1);
+    });
+
+    it("should return empty data for unknown type", () => {
+      const stats = statsCollector.getValidationStats("unknown", { type: "plan" });
+      expect(stats).toMatchObject({
+        type: "plan",
+        granularity: "hour",
+        data: [],
+      });
     });
   });
 });
@@ -975,7 +1185,7 @@ describe("Validation Persistence Integration", () => {
     expect(ruleStats.passed).toBe(2);
 
     // Verify time-filtered stats
-    const recentRuleStats = statsCollector.getRuleStats(sessionId, "no-empty-tasks", 3000);
+    const recentRuleStats = statsCollector.getRuleStats(sessionId, "no-empty-tasks", "3s");
     expect(recentRuleStats.total).toBe(2);
 
     // Verify state persistence

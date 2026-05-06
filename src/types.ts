@@ -96,6 +96,9 @@ export interface Plan {
 
   /** Unix timestamp when plan was last updated */
   updatedAt: number;
+
+  /** Optional metadata for plan-level extensibility */
+  metadata?: Record<string, unknown>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -265,6 +268,41 @@ export interface PluginConfig {
 
   /** Custom agent role definitions */
   agentRoles: AgentRole[];
+
+  /** Validation framework configuration */
+  validation?: ValidationPluginConfig;
+}
+
+/**
+ * Validation Plugin Configuration (from plugin.json validation block)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Validation framework configuration as defined in plugin.json
+ * @openspec-requirement: FR-CONFIG-004
+ */
+export interface ValidationPluginConfig {
+  /** Whether the validation framework is enabled */
+  enabled: boolean;
+
+  /** Default timeout for rule execution in milliseconds */
+  defaultTimeoutMs: number;
+
+  /** Whether to skip all validations */
+  skipValidation: boolean;
+
+  /** History retention configuration */
+  retention: {
+    /** Maximum age of records (e.g., "7d", "24h") */
+    maxAge?: string;
+
+    /** Maximum number of records to keep */
+    maxRecords?: number;
+  };
+
+  /** IDs of rules that are disabled */
+  disabledRules: string[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -368,7 +406,14 @@ export const DEFAULT_CONFIG: PluginConfig = {
   metricsOutput: "blackboard",
   metricsWebhook: "",
   metricsOtelEndpoint: "",
-  agentRoles: DEFAULT_AGENT_ROLES
+  agentRoles: DEFAULT_AGENT_ROLES,
+  validation: {
+    enabled: true,
+    defaultTimeoutMs: 5000,
+    skipValidation: false,
+    retention: { maxAge: "7d", maxRecords: 1000 },
+    disabledRules: []
+  }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -403,7 +448,8 @@ export const PlanSchema = z.object({
   tasks: z.array(TaskSchema),
   taskRunMap: z.record(z.string()),
   createdAt: z.number(),
-  updatedAt: z.number()
+  updatedAt: z.number(),
+  metadata: z.record(z.unknown()).optional()
 });
 
 /**
@@ -461,7 +507,17 @@ export const PluginConfigSchema = z
     metricsOutput: z.enum(["blackboard", "webhook", "otel", "none"]),
     metricsWebhook: z.string().optional(),
     metricsOtelEndpoint: z.string().optional(),
-    agentRoles: z.array(AgentRoleSchema)
+    agentRoles: z.array(AgentRoleSchema),
+    validation: z.object({
+      enabled: z.boolean(),
+      defaultTimeoutMs: z.number().int().min(1, "defaultTimeoutMs must be >= 1"),
+      skipValidation: z.boolean(),
+      retention: z.object({
+        maxAge: z.string().optional(),
+        maxRecords: z.number().int().min(1, "maxRecords must be >= 1").optional()
+      }),
+      disabledRules: z.array(z.string())
+    }).optional()
   })
   .refine(
     (data) => {

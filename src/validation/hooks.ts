@@ -106,6 +106,17 @@ export class ValidationFramework {
       return { valid: true, results: [] };
     }
 
+    // Load history from session if recorder doesn't have it yet
+    if (context.session !== undefined) {
+      const sessionId = this.getSessionId(context.session);
+      if (this.recorder.getHistory(sessionId).length === 0) {
+        const existingRecords = readValidationState(context.session);
+        if (existingRecords.length > 0) {
+          this.recorder.loadHistory(sessionId, existingRecords);
+        }
+      }
+    }
+
     const report = await this.executor.execute(context);
 
     // Record to session if available
@@ -113,6 +124,9 @@ export class ValidationFramework {
       const sessionId = this.getSessionId(context.session);
       const planId = context.plan?.id ?? "unknown";
       this.recorder.recordPlanValidation(sessionId, planId, report);
+
+      // Auto cleanup expired records
+      this.recorder.cleanup(sessionId, this.config.retention);
 
       // Persist to session extension
       const history = this.recorder.getHistory(sessionId);
@@ -133,6 +147,17 @@ export class ValidationFramework {
       return { valid: true, results: [] };
     }
 
+    // Load history from session if recorder doesn't have it yet
+    if (context.session !== undefined) {
+      const sessionId = this.getSessionId(context.session);
+      if (this.recorder.getHistory(sessionId).length === 0) {
+        const existingRecords = readValidationState(context.session);
+        if (existingRecords.length > 0) {
+          this.recorder.loadHistory(sessionId, existingRecords);
+        }
+      }
+    }
+
     const report = await this.executor.execute(context);
 
     // Record to session if available
@@ -141,6 +166,9 @@ export class ValidationFramework {
       const taskId = context.task?.id ?? "unknown";
       const agentId = context.agent?.agentId ?? "unknown";
       this.recorder.recordTaskValidation(sessionId, taskId, agentId, report);
+
+      // Auto cleanup expired records
+      this.recorder.cleanup(sessionId, this.config.retention);
 
       // Persist to session extension
       const history = this.recorder.getHistory(sessionId);
@@ -152,9 +180,20 @@ export class ValidationFramework {
 
   /**
    * Get validation statistics.
+   *
+   * @param sessionId - Session identifier
+   * @param query - Optional query for flexible stats retrieval
    */
-  getStats(sessionId: string): import("./persistence.js").ValidationStats {
-    return this.stats.getAllStats(sessionId);
+  getStats(
+    sessionId: string,
+    query?:
+      | { ruleId: string; timeRange?: string }
+      | { type: string; granularity?: string }
+  ): import("./persistence.js").ValidationStats | Record<string, unknown> {
+    if (query === undefined) {
+      return this.stats.getAllStats(sessionId);
+    }
+    return this.stats.getValidationStats(sessionId, query);
   }
 
   /**

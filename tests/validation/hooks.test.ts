@@ -36,6 +36,7 @@ function createPlan(): Plan {
     taskRunMap: {},
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    metadata: {},
   };
 }
 

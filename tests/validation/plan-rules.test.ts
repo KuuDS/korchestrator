@@ -53,6 +53,7 @@ function createMockPlan(overrides: Partial<Plan> = {}): Plan {
     taskRunMap: {},
     createdAt: now,
     updatedAt: now,
+    metadata: {},
     ...overrides,
   };
 }
@@ -530,6 +531,11 @@ describe("timeoutConstraintValidator", () => {
       code: "TIMEOUT_NOT_CONFIGURED",
       issues: [{ taskId: "task_001", reason: "missing" }],
     });
+    expect(result.fix).toMatchObject({
+      type: "setDefault",
+      description: "Set default timeout to 60s",
+      payload: { timeout: 60 },
+    });
   });
 
   it("should fail when a task has timeout greater than 300", () => {
@@ -545,6 +551,7 @@ describe("timeoutConstraintValidator", () => {
       code: "TIMEOUT_NOT_CONFIGURED",
       issues: [{ taskId: "task_001", timeout: 301, reason: "too_high" }],
     });
+    expect(result.fix).toBeUndefined();
   });
 
   it("should fail when multiple tasks have timeout issues", () => {
@@ -699,7 +706,7 @@ describe("createTimeoutConstraintValidator", () => {
     expect(rule.name).toBe("Timeout Constraint Validator");
     expect(rule.description).toBe("Validates that tasks have reasonable timeout configuration");
     expect(rule.priority).toBe(40);
-    expect(rule.strategy).toBe("warn");
+    expect(rule.strategy).toBe("autoFix");
     expect(rule.enabled).toBe(true);
     expect(typeof rule.execute).toBe("function");
   });
