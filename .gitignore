@@ -59,6 +59,8 @@ temp/
 workspace/
 PLANS/
 *.plan
+openclaw-plugin-plan-subagent-*.tgz
+eval-reports/
 
 # OpenSpec
 .openspec/local/
