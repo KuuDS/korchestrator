@@ -11,8 +11,8 @@ export MOONSHOT_API_KEY="${MOONSHOT_API_KEY:-}"
 echo ""
 echo "Step 1: Verify plugin installation"
 echo "------------------------------------"
-ls -la /app/extensions/plan-subagent/dist/openclaw-entry.js || {
-  echo "ERROR: Plugin dist/openclaw-entry.js not found"
+ls -la /app/extensions/plan-subagent/dist/index.js || {
+  echo "ERROR: Plugin dist/index.js not found"
   exit 1
 }
 cat /app/extensions/plan-subagent/openclaw.plugin.json

@@ -297,18 +297,6 @@ export class Planner {
   // ═════════════════════════════════════════════════════════════════════════════
 
   /**
-   * Register a session extension for plan state persistence.
-   *
-   * Integration point: In production, this calls the OpenClaw gateway API
-   * to register a "plan_state" session extension for persisting plan data
-   * across conversation turns. Example:
-   * gateway.registerSessionExtension("plan_state", { serializer, deserializer });
-   */
-  registerSessionExtension(): void {
-    // Stub: actual registration happens through the OpenClaw gateway API.
-  }
-
-  /**
    * Read a Plan from session state.
    *
    * @param session - The session object (expected to have a `plan_state` property)

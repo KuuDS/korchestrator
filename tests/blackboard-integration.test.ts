@@ -24,6 +24,27 @@ async function resetTestDir(): Promise<void> {
   }
 }
 
+function createMockApi(opts: { logs?: string[] } = {}) {
+  const hooks: Record<string, Array<{ handler: Function; priority: number }>> = {};
+  const logs = opts.logs ?? [];
+  return {
+    logger: {
+      info: (msg: string) => logs.push(msg),
+      error: (_msg: string) => {},
+      warn: (msg: string) => logs.push(msg),
+      debug: (_msg: string) => {},
+    },
+    on: vi.fn((hookName: string, handler: Function, opts: { priority: number }) => {
+      if (!hooks[hookName]) hooks[hookName] = [];
+      hooks[hookName].push({ handler, priority: opts.priority });
+      hooks[hookName].sort((a, b) => a.priority - b.priority);
+    }),
+    registerSessionExtension: vi.fn(),
+    resolvePath: vi.fn((input: string) => input),
+    hooks,
+  };
+}
+
 describe("Blackboard hook integration", () => {
   beforeEach(async () => {
     await resetTestDir();
@@ -40,60 +61,44 @@ describe("Blackboard hook integration", () => {
   });
 
   it("gateway_start instantiates Blackboard with config metrics settings", async () => {
-    const cm = new ConfigManager();
-    cm.setConfig({
-      plannerModel: "gpt-4o-mini",
-      replannerModel: "gpt-4o-mini",
-      maxConcurrency: 3,
-      maxStepsPerAgent: 20,
-      skipClassification: false,
-      classificationRules: [],
-      metricsOutput: "webhook",
-      metricsWebhook: "https://example.com/hook",
-      metricsOtelEndpoint: "",
-      agentRoles: [],
-    });
-    setConfigManager(cm);
-
     const logs: string[] = [];
-    const ctx = {
-      logger: {
-        info: (msg: string) => logs.push(msg),
-        error: (_msg: string) => {},
-        warn: (_msg: string) => {},
-      },
-      registerHook: () => {},
-    };
-
+    const mockApi = createMockApi({ logs });
     const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const gatewayStart = entry.hooks.find((h) => h.event === "gateway_start");
+    entry.register(mockApi);
+
+    const gatewayStart = mockApi.hooks["gateway_start"]?.[0];
     expect(gatewayStart).toBeDefined();
-    await gatewayStart!.handler(ctx);
+
+    // Reset blackboard so we can verify the handler creates it
+    setBlackboard(null);
+
+    await gatewayStart!.handler({
+      context: {
+        configPath: "/fake/plugin.json",
+      },
+    });
 
     const bb = getBlackboard();
     expect(bb).not.toBeNull();
   });
 
   it("after_tool_call writes result via blackboard when runId and result are present", async () => {
+    const logs: string[] = [];
+    const mockApi = createMockApi({ logs });
+    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
+    entry.register(mockApi);
+
+    // Set test blackboard AFTER register() so it overrides the one created during registration
     const bb = new Blackboard({ basePath: TEST_BASE });
     setBlackboard(bb);
 
-    const logs: string[] = [];
-    const ctx = {
+    const afterToolCall = mockApi.hooks["after_tool_call"]?.[0];
+    expect(afterToolCall).toBeDefined();
+    await afterToolCall!.handler({
       runId: "run_tool_1",
       result: "tool output",
-      logger: {
-        info: (msg: string) => logs.push(msg),
-        error: (_msg: string) => {},
-        warn: (_msg: string) => {},
-      },
-      registerHook: () => {},
-    };
-
-    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const afterToolCall = entry.hooks.find((h) => h.event === "after_tool_call");
-    expect(afterToolCall).toBeDefined();
-    await afterToolCall!.handler(ctx);
+      context: {},
+    });
 
     const content = await readFile(join(TEST_BASE, "results", "run_tool_1.md"), "utf-8");
     expect(content).toBe("tool output");
@@ -101,50 +106,46 @@ describe("Blackboard hook integration", () => {
   });
 
   it("after_tool_call logs warning when blackboard is not initialized", async () => {
-    setBlackboard(null);
     const logs: string[] = [];
-    const ctx = {
+    const mockApi = createMockApi({ logs });
+    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
+    entry.register(mockApi);
+
+    // Null out the blackboard AFTER register() created one
+    setBlackboard(null);
+
+    const afterToolCall = mockApi.hooks["after_tool_call"]?.[0];
+    await afterToolCall!.handler({
       runId: "run_tool_2",
       result: "tool output",
-      logger: {
-        info: (_msg: string) => {},
-        error: (_msg: string) => {},
-        warn: (msg: string) => logs.push(msg),
-      },
-      registerHook: () => {},
-    };
-
-    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const afterToolCall = entry.hooks.find((h) => h.event === "after_tool_call");
-    await afterToolCall!.handler(ctx);
+      context: {},
+    });
     expect(logs.some((l) => l.includes("Blackboard not initialized"))).toBe(true);
   });
 
   it("agent_end writes metrics via blackboard when metrics are present", async () => {
+    const logs: string[] = [];
+    const mockApi = createMockApi({ logs });
+    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
+    entry.register(mockApi);
+
+    // Set test blackboard AFTER register() so it overrides the one created during registration
     const bb = new Blackboard({ basePath: TEST_BASE });
     setBlackboard(bb);
 
-    const logs: string[] = [];
+    const agentEnd = mockApi.hooks["agent_end"]?.[0];
+    expect(agentEnd).toBeDefined();
+
     const metrics: ExecutionMetrics = {
       runId: "run_agent_1",
       durationMs: 500,
       success: true,
       timestamp: 1700000000,
     };
-    const ctx = {
+    await agentEnd!.handler({
       metrics,
-      logger: {
-        info: (msg: string) => logs.push(msg),
-        error: (_msg: string) => {},
-        warn: (_msg: string) => {},
-      },
-      registerHook: () => {},
-    };
-
-    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const agentEnd = entry.hooks.find((h) => h.event === "agent_end");
-    expect(agentEnd).toBeDefined();
-    await agentEnd!.handler(ctx);
+      context: {},
+    });
 
     const content = await readFile(join(TEST_BASE, "metrics", "run_agent_1.json"), "utf-8");
     const parsed = JSON.parse(content) as ExecutionMetrics;
@@ -153,48 +154,44 @@ describe("Blackboard hook integration", () => {
   });
 
   it("agent_end logs warning when blackboard is not initialized", async () => {
-    setBlackboard(null);
     const logs: string[] = [];
+    const mockApi = createMockApi({ logs });
+    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
+    entry.register(mockApi);
+
+    // Null out the blackboard AFTER register() created one
+    setBlackboard(null);
+
+    const agentEnd = mockApi.hooks["agent_end"]?.[0];
+
     const metrics: ExecutionMetrics = {
       runId: "run_agent_2",
       durationMs: 500,
       success: true,
       timestamp: 1700000000,
     };
-    const ctx = {
+    await agentEnd!.handler({
       metrics,
-      logger: {
-        info: (_msg: string) => {},
-        error: (_msg: string) => {},
-        warn: (msg: string) => logs.push(msg),
-      },
-      registerHook: () => {},
-    };
-
-    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const agentEnd = entry.hooks.find((h) => h.event === "agent_end");
-    await agentEnd!.handler(ctx);
+      context: {},
+    });
     expect(logs.some((l) => l.includes("Blackboard not initialized"))).toBe(true);
   });
 
   it("agent_end ignores context without valid metrics", async () => {
+    const logs: string[] = [];
+    const mockApi = createMockApi({ logs });
+    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
+    entry.register(mockApi);
+
+    // Set test blackboard AFTER register() so it overrides the one created during registration
     const bb = new Blackboard({ basePath: TEST_BASE });
     setBlackboard(bb);
 
-    const logs: string[] = [];
-    const ctx = {
+    const agentEnd = mockApi.hooks["agent_end"]?.[0];
+    await agentEnd!.handler({
       metrics: { invalid: true },
-      logger: {
-        info: (msg: string) => logs.push(msg),
-        error: (_msg: string) => {},
-        warn: (_msg: string) => {},
-      },
-      registerHook: () => {},
-    };
-
-    const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const agentEnd = entry.hooks.find((h) => h.event === "agent_end");
-    await agentEnd!.handler(ctx);
+      context: {},
+    });
     expect(logs.some((l) => l.includes("Persisted metrics"))).toBe(false);
   });
 
@@ -202,20 +199,17 @@ describe("Blackboard hook integration", () => {
     setActivePlans(["plan_1", "plan_2"]);
     const sessionState: Record<string, unknown> = {};
     const logs: string[] = [];
-    const ctx = {
-      sessionState,
-      logger: {
-        info: (msg: string) => logs.push(msg),
-        error: (_msg: string) => {},
-        warn: (_msg: string) => {},
-      },
-      registerHook: () => {},
-    };
-
+    const mockApi = createMockApi({ logs });
     const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const gatewayStop = entry.hooks.find((h) => h.event === "gateway_stop");
+    entry.register(mockApi);
+
+    const gatewayStop = mockApi.hooks["gateway_stop"]?.[0];
     expect(gatewayStop).toBeDefined();
-    await gatewayStop!.handler(ctx);
+    await gatewayStop!.handler({
+      context: {
+        sessionState,
+      },
+    });
 
     expect(sessionState.activePlans).toEqual(["plan_1", "plan_2"]);
     expect(logs.some((l) => l.includes("Persisted 2 active plans"))).toBe(true);
@@ -223,10 +217,11 @@ describe("Blackboard hook integration", () => {
 
   it("definePluginEntry registers all expected hooks", () => {
     const entry = definePluginEntry({ id: "test", name: "Test", version: "0.0.1" });
-    const events = entry.hooks.map((h) => h.event);
-    expect(events).toContain("gateway_start");
-    expect(events).toContain("gateway_stop");
-    expect(events).toContain("after_tool_call");
-    expect(events).toContain("agent_end");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    expect(mockApi.hooks["gateway_start"]).toBeDefined();
+    expect(mockApi.hooks["gateway_stop"]).toBeDefined();
+    expect(mockApi.hooks["after_tool_call"]).toBeDefined();
+    expect(mockApi.hooks["agent_end"]).toBeDefined();
   });
 });

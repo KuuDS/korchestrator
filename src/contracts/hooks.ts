@@ -23,6 +23,29 @@ export interface OpenClawApi {
   sendMessage(msg: unknown): Promise<unknown>;
   /** Access session-scoped key-value store */
   getSessionStore(): Record<string, unknown>;
+  /** Register a hook handler */
+  on(
+    hookName: string,
+    handler: (event: unknown) => unknown | Promise<unknown>,
+    opts?: { priority?: number }
+  ): void;
+  /** Logger instance */
+  logger: {
+    debug: (msg: string) => void;
+    info: (msg: string) => void;
+    warn: (msg: string) => void;
+    error: (msg: string) => void;
+  };
+  /** Register a session extension for cross-turn state persistence */
+  registerSessionExtension(
+    name: string,
+    opts: {
+      serializer: (value: unknown) => unknown;
+      deserializer: (data: unknown) => unknown;
+    }
+  ): void;
+  /** Resolve a path relative to the plugin root */
+  resolvePath(input: string): string;
 }
 
 /** Stub for session extension state */

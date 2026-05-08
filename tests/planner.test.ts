@@ -456,13 +456,13 @@ describe("Planner state persistence", () => {
     expect(() => planner.writePlanState(undefined, plan)).not.toThrow();
   });
 
-  it("registerSessionExtension does not throw", () => {
+  it("registerSessionExtension is no longer a method", () => {
     const planner = new Planner(
       { model: "test-model" },
       mockGenerate("")
     );
 
-    expect(() => planner.registerSessionExtension()).not.toThrow();
+    expect("registerSessionExtension" in planner).toBe(false);
   });
 });
 

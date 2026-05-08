@@ -14,6 +14,28 @@ function createValidConfig(overrides: Partial<PluginConfig> = {}): PluginConfig 
   };
 }
 
+function createMockApi(opts: { logs?: string[] } = {}) {
+  const hooks: Record<string, Array<{ handler: Function; priority: number }>> = {};
+  const logs = opts.logs ?? [];
+  return {
+    logger: {
+      info: (msg: string) => logs.push(msg),
+      error: (_msg: string) => {},
+      warn: (_msg: string) => {},
+      debug: (_msg: string) => {},
+    },
+    on: vi.fn((hookName: string, handler: Function, opts: { priority: number }) => {
+      if (!hooks[hookName]) hooks[hookName] = [];
+      hooks[hookName].push({ handler, priority: opts.priority });
+      hooks[hookName].sort((a, b) => a.priority - b.priority);
+    }),
+    registerSessionExtension: vi.fn(),
+    resolvePath: vi.fn((input: string) => input),
+    hooks,
+    logs,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ConfigManager.load
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -393,25 +415,30 @@ describe("Plugin entry lifecycle hooks", () => {
   it("definePluginEntry registers gateway_start and gateway_stop hooks", async () => {
     const { definePluginEntry } = await import("../src/index.js");
     const entry = definePluginEntry({ id: "test", name: "Test", version: "1.0.0" });
-    const events = entry.hooks.map((h: { event: string }) => h.event);
-    expect(events).toContain("gateway_start");
-    expect(events).toContain("gateway_stop");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    expect(mockApi.hooks["gateway_start"]).toBeDefined();
+    expect(mockApi.hooks["gateway_start"]!.length).toBeGreaterThan(0);
+    expect(mockApi.hooks["gateway_stop"]).toBeDefined();
+    expect(mockApi.hooks["gateway_stop"]!.length).toBeGreaterThan(0);
   });
 
   it("gateway_start hook loads config and starts watcher", async () => {
     const { definePluginEntry, setConfigManager, getConfigManager } = await import("../src/index.js");
     setConfigManager(null);
     const entry = definePluginEntry({ id: "test", name: "Test", version: "1.0.0" });
-    const startHook = entry.hooks.find((h) => h.event === "gateway_start");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    const startHook = mockApi.hooks["gateway_start"]?.[0];
     expect(startHook).toBeDefined();
 
     vi.spyOn(configLoader, "loadConfigFile").mockResolvedValue(createValidConfig({ plannerModel: "gpt-4o" }));
-    const ctx = {
-      configPath: "/fake/plugin.json",
-      logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
-      registerHook: vi.fn()
+    const event = {
+      context: {
+        configPath: "/fake/plugin.json",
+      }
     };
-    await startHook!.handler(ctx);
+    await startHook!.handler(event);
     expect(getConfigManager().getConfig().plannerModel).toBe("gpt-4o");
   });
 
@@ -419,18 +446,19 @@ describe("Plugin entry lifecycle hooks", () => {
     const { definePluginEntry, setActivePlans, setConfigManager } = await import("../src/index.js");
     setConfigManager(null);
     const entry = definePluginEntry({ id: "test", name: "Test", version: "1.0.0" });
-    const stopHook = entry.hooks.find((h) => h.event === "gateway_stop");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    const stopHook = mockApi.hooks["gateway_stop"]?.[0];
     expect(stopHook).toBeDefined();
 
     setActivePlans(["plan_001", "plan_002"]);
     const sessionState: Record<string, unknown> = {};
-    const ctx = {
-      configPath: "/fake/plugin.json",
-      logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
-      registerHook: vi.fn(),
-      sessionState
+    const event = {
+      context: {
+        sessionState,
+      }
     };
-    await stopHook!.handler(ctx);
+    await stopHook!.handler(event);
     expect(sessionState.activePlans).toEqual(["plan_001", "plan_002"]);
   });
 
@@ -438,15 +466,17 @@ describe("Plugin entry lifecycle hooks", () => {
     const { definePluginEntry, setConfigManager, getConfigManager } = await import("../src/index.js");
     setConfigManager(null);
     const entry = definePluginEntry({ id: "test", name: "Test", version: "1.0.0" });
-    const startHook = entry.hooks.find((h) => h.event === "gateway_start");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    const startHook = mockApi.hooks["gateway_start"]?.[0];
 
     vi.spyOn(configLoader, "loadConfigFile").mockRejectedValue(new Error("ENOENT"));
-    const ctx = {
-      configPath: "/fake/plugin.json",
-      logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
-      registerHook: vi.fn()
+    const event = {
+      context: {
+        configPath: "/fake/plugin.json",
+      }
     };
-    await startHook!.handler(ctx);
+    await startHook!.handler(event);
     expect(getConfigManager().getConfig().plannerModel).toBe(DEFAULT_CONFIG.plannerModel);
   });
 });
@@ -464,15 +494,17 @@ describe("Change detection and reload sequence", () => {
     const { definePluginEntry, setActivePlans, getConfigManager, setConfigManager } = await import("../src/index.js");
     setConfigManager(null);
     const entry = definePluginEntry({ id: "test", name: "Test", version: "1.0.0" });
-    const startHook = entry.hooks.find((h) => h.event === "gateway_start");
+    const mockApi = createMockApi();
+    entry.register(mockApi);
+    const startHook = mockApi.hooks["gateway_start"]?.[0];
 
     vi.spyOn(configLoader, "loadConfigFile").mockResolvedValue(createValidConfig());
-    const ctx = {
-      configPath: "/fake/plugin.json",
-      logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
-      registerHook: vi.fn()
+    const event = {
+      context: {
+        configPath: "/fake/plugin.json",
+      }
     };
-    await startHook!.handler(ctx);
+    await startHook!.handler(event);
 
     setActivePlans(["plan_001"]);
     // Simulate a config change by calling the internal handler indirectly
@@ -480,7 +512,7 @@ describe("Change detection and reload sequence", () => {
     const newConfig = createValidConfig({ plannerModel: "gpt-4o" });
     vi.spyOn(configLoader, "loadConfigFile").mockResolvedValue(newConfig);
     // Trigger reload by invoking start again (simulating stop -> start)
-    await startHook!.handler(ctx);
+    await startHook!.handler(event);
     expect(getConfigManager().getConfig().plannerModel).toBe("gpt-4o");
     // Active plans should still be there
     const { getActivePlans } = await import("../src/index.js");

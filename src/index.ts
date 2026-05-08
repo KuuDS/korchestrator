@@ -1,11 +1,20 @@
+import { readFileSync } from "node:fs";
 import { ConfigManager, type ConfigDiff } from "./config.js";
 import { watchConfig } from "./config-loader.js";
-import { type PluginConfig, DEFAULT_CONFIG } from "./types.js";
+import { type PluginConfig, DEFAULT_CONFIG, PluginConfigSchema, PlanSchema } from "./types.js";
 import { Blackboard } from "./blackboard.js";
-import { Planner } from "./planner.js";
+import { Planner, type GenerateFn } from "./planner.js";
 import { Replanner } from "./replanner.js";
 import { TaskRouter } from "./router.js";
-import type { BeforeAgentReplyEvent, BeforePromptBuildEvent, BeforeAgentFinalizeEvent, HeartbeatPromptContributionEvent, BeforeToolCallEvent } from "./contracts/hooks.js";
+import { createLlmClient } from "./llm.js";
+import type {
+  BeforeAgentReplyEvent,
+  BeforePromptBuildEvent,
+  BeforeAgentFinalizeEvent,
+  HeartbeatPromptContributionEvent,
+  BeforeToolCallEvent,
+  OpenClawApi,
+} from "./contracts/hooks.js";
 import {
   ValidationFramework,
   createPlanValidationHook,
@@ -15,7 +24,9 @@ import {
 import type { ValidationRule } from "./validation/types.js";
 
 /**
- * Hook context provided by the OpenClaw gateway.
+ * Legacy hook context provided by the mock gateway.
+ * Kept for backward compatibility with existing tests and old handlers.
+ * @deprecated Use OpenClaw event types from contracts/hooks.ts instead.
  */
 export interface HookContext {
   /** Path to the plugin configuration file */
@@ -34,20 +45,18 @@ export interface HookContext {
   ) => void;
   /** Persisted session state */
   sessionState?: Record<string, unknown>;
+  /** Allow arbitrary properties for event bridging */
+  [key: string]: unknown;
 }
 
 /**
- * Plugin entry definition structure.
+ * Plugin entry definition conforming to OpenClaw SDK contract.
  */
 export interface PluginEntry {
   id: string;
   name: string;
-  version: string;
-  hooks: Array<{
-    event: string;
-    handler: (ctx: HookContext) => Promise<void> | void;
-    priority: number;
-  }>;
+  register(api: OpenClawApi): void;
+  allowConversationAccess: boolean;
 }
 
 let configManager: ConfigManager | null = null;
@@ -233,6 +242,13 @@ async function initializeComponents(config: PluginConfig, ctx: HookContext): Pro
   log(ctx, "info", "Blackboard initialized");
 
   // Create Planner with config-derived settings
+  const apiKey = process.env.MOONSHOT_API_KEY;
+  const plannerGenerate: GenerateFn = apiKey
+    ? createLlmClient({ apiKey, model: config.plannerModel, logger: ctx.logger })
+    : async (prompt: string) => {
+        log(ctx, "warn", `MOONSHOT_API_KEY not set. Planner LLM generate fallback. Prompt length: ${prompt.length}`);
+        return "complex";
+      };
   const pl = new Planner(
     {
       model: config.plannerModel,
@@ -240,14 +256,9 @@ async function initializeComponents(config: PluginConfig, ctx: HookContext): Pro
       classificationRules: config.classificationRules,
       skipClassification: config.skipClassification,
     },
-    async (prompt: string) => {
-      // Default LLM generate stub — in production this would call the gateway API
-      log(ctx, "warn", `LLM generate called but no real backend wired. Prompt length: ${prompt.length}`);
-      return "complex";
-    }
+    plannerGenerate
   );
   setPlanner(pl);
-  pl.registerSessionExtension();
   log(ctx, "info", "Planner initialized");
 
   // Instantiate TaskRouter with config-derived settings
@@ -259,13 +270,16 @@ async function initializeComponents(config: PluginConfig, ctx: HookContext): Pro
   log(ctx, "info", `TaskRouter initialized with maxConcurrency=${config.maxConcurrency}`);
 
   // Instantiate Replanner with config-derived settings
+  const replannerGenerate = apiKey
+    ? createLlmClient({ apiKey, model: config.replannerModel, logger: ctx.logger })
+    : async (prompt: string) => {
+        log(ctx, "warn", `MOONSHOT_API_KEY not set. Replanner LLM generate fallback. Prompt length: ${prompt.length}`);
+        return JSON.stringify({ strategy: "retry", reason: "Default fallback" });
+      };
   const rp = new Replanner({
     model: config.replannerModel,
     maxRetries: 3,
-    generate: async (prompt: string) => {
-      log(ctx, "warn", `Replanner LLM generate called but no real backend wired. Prompt length: ${prompt.length}`);
-      return JSON.stringify({ strategy: "retry", reason: "Default fallback" });
-    },
+    generate: replannerGenerate,
   });
   setReplanner(rp);
   log(ctx, "info", "Replanner initialized");
@@ -849,29 +863,346 @@ function createTaskValidationHookWrapper(): (ctx: HookContext) => Promise<void> 
 }
 
 /**
- * Define the plugin entry point.
+ * Build a legacy HookContext from an OpenClaw event object.
+ * Used to bridge new event-based handlers to legacy ctx-based handlers.
  */
-export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: PluginEntry["hooks"] }): PluginEntry {
+function buildLegacyContext(api: OpenClawApi, event: unknown): HookContext {
+  const evt = event as Record<string, unknown>;
+  const context = evt.context as Record<string, unknown> | undefined;
   return {
-    ...entry,
-    hooks: [
-      ...(entry.hooks ?? []),
-      { event: "gateway_start", handler: handleGatewayStart, priority: 90 },
-      { event: "gateway_stop", handler: handleGatewayStop, priority: 90 },
-      { event: "before_agent_reply", handler: handleBeforeAgentReply, priority: 80 },
-      { event: "before_agent_reply", handler: createPlanValidationHookWrapper(), priority: 75 },
-      { event: "before_prompt_build", handler: handleBeforePromptBuild, priority: 70 },
-      { event: "subagent_delivery_target", handler: handleSubagentDeliveryTarget, priority: 70 },
-      { event: "subagent_delivery_target", handler: createTaskValidationHookWrapper(), priority: 65 },
-      { event: "subagent_spawning", handler: handleSubagentSpawning, priority: 70 },
-      { event: "before_agent_finalize", handler: handleBeforeAgentFinalize, priority: 60 },
-      { event: "before_tool_call", handler: handleBeforeToolCall, priority: 50 },
-      { event: "subagent_spawned", handler: handleSubagentSpawned, priority: 50 },
-      { event: "subagent_ended", handler: handleSubagentEnded, priority: 50 },
-      { event: "after_tool_call", handler: handleAfterToolCall, priority: 50 },
-      { event: "agent_end", handler: handleAgentEnd, priority: 50 },
-      { event: "heartbeat_prompt_contribution", handler: handleHeartbeatPromptContribution, priority: 40 },
-    ]
+    configPath: typeof context?.configPath === "string" ? context.configPath : undefined,
+    logger: api.logger,
+    registerHook: () => {},
+    sessionState: context?.sessionState as Record<string, unknown> | undefined,
+    ...evt,
+  };
+}
+
+/**
+ * Define the plugin entry point conforming to OpenClaw SDK contract.
+ */
+export function definePluginEntry(
+  entry: Omit<PluginEntry, "register" | "allowConversationAccess"> & {
+    version?: string;
+    allowConversationAccess?: boolean;
+  }
+): PluginEntry {
+  return {
+    id: entry.id,
+    name: entry.name,
+    allowConversationAccess: entry.allowConversationAccess ?? true,
+    register(api: OpenClawApi): void {
+      api.logger.info("Plan-subagent plugin registering...");
+
+      // ── Register session extension for plan state persistence ──
+      if (typeof api.registerSessionExtension === "function") {
+        api.registerSessionExtension("plan_state", {
+          serializer: (plan: unknown) => plan,
+          deserializer: (data: unknown) => {
+            const result = PlanSchema.safeParse(data);
+            return result.success ? result.data : null;
+          },
+        });
+        api.logger.info("Registered plan_state session extension");
+      } else {
+        api.logger.warn("api.registerSessionExtension not available — plan state persistence will use direct session mutation");
+      }
+
+      // ── Initialize config manager ──
+      const cm = new ConfigManager();
+      setConfigManager(cm);
+
+      const configPath = api.resolvePath("../plugin.json");
+      try {
+        const content = readFileSync(configPath, "utf-8");
+        const raw = JSON.parse(content) as unknown;
+        const parseResult = PluginConfigSchema.safeParse(raw);
+        if (parseResult.success) {
+          cm.setConfig(parseResult.data);
+          api.logger.info(`Config loaded from ${configPath}`);
+        } else {
+          const issues = parseResult.error.issues
+            .map((i) => `${i.path.join(".")}: ${i.message}`)
+            .join("; ");
+          api.logger.error(
+            `Config validation failed: ${issues}. Using default config.`
+          );
+          cm.setConfig(DEFAULT_CONFIG);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        api.logger.error(
+          `Failed to load config: ${msg}. Using default config.`
+        );
+        cm.setConfig(DEFAULT_CONFIG);
+      }
+
+      const config = cm.getConfig();
+
+      // ── Initialize Blackboard ──
+      const bb = new Blackboard({
+        basePath: api.resolvePath("../workspace"),
+        metricsOutput: config.metricsOutput,
+        metricsWebhook: config.metricsWebhook,
+        metricsOtelEndpoint: config.metricsOtelEndpoint,
+      });
+      setBlackboard(bb);
+      api.logger.info("Blackboard initialized");
+
+      // ── Initialize Planner ──
+      const apiKey = process.env.MOONSHOT_API_KEY;
+      const plannerGenerate: GenerateFn = apiKey
+        ? createLlmClient({ apiKey, model: config.plannerModel, logger: api.logger })
+        : async (prompt: string) => {
+            api.logger.warn(
+              `MOONSHOT_API_KEY not set. Planner LLM generate fallback. Prompt length: ${prompt.length}`
+            );
+            return "complex";
+          };
+      const pl = new Planner(
+        {
+          model: config.plannerModel,
+          maxTasks: 20,
+          classificationRules: config.classificationRules,
+          skipClassification: config.skipClassification,
+        },
+        plannerGenerate
+      );
+      setPlanner(pl);
+      api.logger.info("Planner initialized");
+
+      // ── Initialize TaskRouter ──
+      const tr = new TaskRouter({
+        maxConcurrency: config.maxConcurrency,
+        agentPool: config.agentRoles,
+      });
+      setTaskRouter(tr);
+      api.logger.info(
+        `TaskRouter initialized with maxConcurrency=${config.maxConcurrency}`
+      );
+
+      // ── Initialize Replanner ──
+      const replannerGenerate = apiKey
+        ? createLlmClient({ apiKey, model: config.replannerModel, logger: api.logger })
+        : async (prompt: string) => {
+            api.logger.warn(
+              `MOONSHOT_API_KEY not set. Replanner LLM generate fallback. Prompt length: ${prompt.length}`
+            );
+            return JSON.stringify({ strategy: "retry", reason: "Default fallback" });
+          };
+      const rp = new Replanner({
+        model: config.replannerModel,
+        maxRetries: 3,
+        generate: replannerGenerate,
+      });
+      setReplanner(rp);
+      api.logger.info("Replanner initialized");
+
+      // ── Initialize Validation Framework ──
+      const validationCfg = config.validation;
+      const vf = createValidationFramework({
+        defaultTimeoutMs: validationCfg?.defaultTimeoutMs ?? 5000,
+        skipValidation: validationCfg?.skipValidation ?? false,
+        retention: validationCfg?.retention ?? { maxAge: "7d", maxRecords: 1000 },
+        disabledRules: validationCfg?.disabledRules ?? [],
+      });
+      setValidationFramework(vf);
+      api.logger.info("ValidationFramework initialized with default rules");
+
+      // ── Register hooks ──
+
+      api.on(
+        "gateway_start",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleGatewayStart(ctx);
+        },
+        { priority: 90 }
+      );
+
+      api.on(
+        "gateway_stop",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleGatewayStop(ctx);
+        },
+        { priority: 90 }
+      );
+
+      api.on(
+        "before_agent_reply",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleBeforeAgentReply(ctx);
+          return undefined;
+        },
+        { priority: 80 }
+      );
+
+      api.on(
+        "before_agent_reply",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          const wrapper = createPlanValidationHookWrapper();
+          await wrapper(ctx);
+          return undefined;
+        },
+        { priority: 75 }
+      );
+
+      api.on(
+        "before_prompt_build",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleBeforePromptBuild(ctx);
+          const prependContext = (event as Record<string, unknown>).prependContext as
+            | string
+            | undefined;
+          if (prependContext !== undefined) {
+            return { prependContext };
+          }
+          return undefined;
+        },
+        { priority: 70 }
+      );
+
+      api.on(
+        "subagent_delivery_target",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleSubagentDeliveryTarget(ctx);
+          const targetAgentId = (event as Record<string, unknown>).targetAgentId as
+            | string
+            | undefined;
+          if (targetAgentId === undefined) {
+            throw new Error("subagent_delivery_target did not produce targetAgentId");
+          }
+          return { targetAgentId };
+        },
+        { priority: 70 }
+      );
+
+      api.on(
+        "subagent_delivery_target",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          const wrapper = createTaskValidationHookWrapper();
+          await wrapper(ctx);
+          const block = (event as Record<string, unknown>).block as boolean | undefined;
+          if (block === true) {
+            return {
+              targetAgentId: "",
+            };
+          }
+          // Return a dummy targetAgentId if the validation wrapper didn't block.
+          // The primary delivery_target handler (priority 70) already computed the real one.
+          return undefined;
+        },
+        { priority: 65 }
+      );
+
+      api.on(
+        "subagent_spawning",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleSubagentSpawning(ctx);
+          const block = (event as Record<string, unknown>).block as boolean | undefined;
+          if (block === true) {
+            return { block: true, reason: (event as Record<string, unknown>).reason as string | undefined };
+          }
+          return undefined;
+        },
+        { priority: 70 }
+      );
+
+      api.on(
+        "before_agent_finalize",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleBeforeAgentFinalize(ctx);
+          const action = (event as Record<string, unknown>).action as
+            | "revise"
+            | "finalize"
+            | undefined;
+          if (action === undefined) {
+            return { action: "finalize" as const };
+          }
+          return {
+            action,
+            reason: (event as Record<string, unknown>).reason as string | undefined,
+          };
+        },
+        { priority: 60 }
+      );
+
+      api.on(
+        "before_tool_call",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleBeforeToolCall(ctx);
+          return undefined;
+        },
+        { priority: 50 }
+      );
+
+      api.on(
+        "subagent_spawned",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleSubagentSpawned(ctx);
+          return undefined;
+        },
+        { priority: 50 }
+      );
+
+      api.on(
+        "subagent_ended",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleSubagentEnded(ctx);
+          return undefined;
+        },
+        { priority: 50 }
+      );
+
+      api.on(
+        "after_tool_call",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleAfterToolCall(ctx);
+          return undefined;
+        },
+        { priority: 50 }
+      );
+
+      api.on(
+        "agent_end",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleAgentEnd(ctx);
+          return undefined;
+        },
+        { priority: 50 }
+      );
+
+      api.on(
+        "heartbeat_prompt_contribution",
+        async (event) => {
+          const ctx = buildLegacyContext(api, event);
+          await handleHeartbeatPromptContribution(ctx);
+          const contribution = (event as Record<string, unknown>).contribution as
+            | string
+            | undefined;
+          if (contribution !== undefined && contribution.length > 0) {
+            return { contribution };
+          }
+          return undefined;
+        },
+        { priority: 40 }
+      );
+
+      api.logger.info("Plan-subagent plugin registered successfully");
+    },
   };
 }
 
@@ -879,7 +1210,6 @@ export function definePluginEntry(entry: Omit<PluginEntry, "hooks"> & { hooks?: 
  * Plugin entry point for OpenClaw.
  */
 export default definePluginEntry({
-  id: "plan-subagent",
+  id: "openclaw-plugin-plan-subagent",
   name: "Plan-Task-Build Subagent Orchestrator",
-  version: "0.1.0"
 });

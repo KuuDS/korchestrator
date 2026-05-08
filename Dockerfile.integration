@@ -2,7 +2,8 @@
 ARG OPENCLAW_VERSION=latest
 
 # Use official OpenClaw image from GitHub Container Registry
-FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
+# Fallback to alpine/openclaw for local cached image
+FROM alpine/openclaw:${OPENCLAW_VERSION}
 
 USER root
 
@@ -15,7 +16,7 @@ RUN cd /app/extensions/plan-subagent && \
 
 # Add openclaw.extensions to package.json so OpenClaw discovers it
 RUN cd /app/extensions/plan-subagent && \
-    node -e 'const fs=require("fs");const pkg=JSON.parse(fs.readFileSync("package.json","utf8"));pkg.openclaw={extensions:["./dist/openclaw-entry.js"]};fs.writeFileSync("package.json",JSON.stringify(pkg,null,2)+"\n")'
+    node -e 'const fs=require("fs");const pkg=JSON.parse(fs.readFileSync("package.json","utf8"));pkg.openclaw={extensions:["./dist/index.js"]};fs.writeFileSync("package.json",JSON.stringify(pkg,null,2)+"\n")'
 
 # Create OpenClaw plugin manifest
 RUN cd /app/extensions/plan-subagent && \
@@ -60,7 +61,8 @@ RUN chmod +x /app/integration-test.sh
 USER node
 WORKDIR /app
 
-ENV MOONSHOT_API_KEY=""
+ARG MOONSHOT_API_KEY
+ENV MOONSHOT_API_KEY="${MOONSHOT_API_KEY}"
 ENV OPENCLAW_STATE_DIR="/home/node/.openclaw"
 ENV OPENCLAW_HOME="/home/node"
 
